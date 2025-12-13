@@ -14,6 +14,7 @@
   "build": {
     "appId": "com.geekez.browser",
     "productName": "GeekEZ Browser",
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
     "directories": {
       "output": "dist"
     },
