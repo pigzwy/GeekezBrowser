@@ -184,9 +184,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: |
-            dist/*.exe
-            dist/win-unpacked
+          path: dist/GeekEZ*.exe
 
   release:
     needs: [build-mac-arm64, build-mac-x64, build-windows]
