@@ -19,7 +19,7 @@
 
 **GeekEZ Browser** is a professional anti-detect browser built on **Electron** and **Puppeteer**, integrated with the powerful **Xray-core**. 
 
-It is designed to help e-commerce operators (Amazon, TikTok, Facebook, Shopee, etc.) manage multiple accounts safely by strictly isolating browser fingerprints, network environments, and local storage. Unlike other tools, GeekEZ focuses on **"Native Consistency"** to bypass advanced detectors like Cloudflare and BrowserScan.
+It is designed to help e-commerce operators (Amazon, TikTok, Facebook, Shopee, etc.) manage multiple accounts safely by strictly isolating browser fingerprints, network environments, and local storage. It bypasses advanced detectors like Cloudflare, Pixelscan and BrowserScan.
 
 ## 📸 Screenshots
 
@@ -37,24 +37,13 @@ It is designed to help e-commerce operators (Amazon, TikTok, Facebook, Shopee, e
 
 ### 🛡️ Advanced Fingerprint Isolation
 *   **Hardware Randomization**: Randomizes **CPU Cores** (4/8/12/16) and **Device Memory** (4/8/16 GB) for each profile, significantly increasing fingerprint uniqueness.
-*   **Native Injection Strategy**: Uses **Chromium Native Arguments** combined with **Puppeteer** for noise injection. Passes **Cloudflare Turnstile** and **BrowserScan** perfectly.
-*   **Media Noise**: Adds non-intrusive noise to **Canvas**, **WebGL**, and **AudioContext** to create unique hardware hashes for every profile.
-*   **TLS Fingerprint Safety**: Uses **Real Chrome** browser, ensuring TLS fingerprints (JA3) match standard Chrome behavior, indistinguishable from commercial tools.
 *   **Timezone & Geo Spoofing**: 
-    - **Auto (No Change)** mode for sensitive login pages (AWS, Oracle)
-    - Custom timezone selection with TZ environment variable
+    - **Auto (No Change)** mode: Automatically matches the time zone and latitude and longitude of the proxy IP location.
     - Geolocation spoofing with 50+ cities worldwide
 *   **Language Spoofing**: 
     - 60+ languages covering all regions
-    - Minimal Intl API hook to avoid detection
     - Full browser language, HTTP headers, and internationalization API modification
 *   **WebRTC Protection**: Forces `disable_non_proxied_udp` policy to prevent real IP leaks.
-
-### ⚡ Performance Optimized
-*   **GPU Acceleration**: Hardware acceleration enabled for smooth UI and fast rendering.
-*   **Fast Startup**: Optimized Xray integration reduces startup time by **40%**.
-*   **Low Memory**: Smart cache management and memory limits reduce RAM usage by **30%**.
-*   **Auto Cleanup**: Automatically cleans cache and temporary files on exit to save disk space.
 
 ### 🔗 Powerful Network Engine (Xray-core)
 *   **Full Protocol Support**: VMess, VLESS, Trojan, Shadowsocks (including **2022**), Socks5, HTTP.
@@ -65,7 +54,7 @@ It is designed to help e-commerce operators (Amazon, TikTok, Facebook, Shopee, e
 ### 🧩 Workflow & Management
 *   **Extension Support**: Import unpacked Chrome extensions (e.g., MetaMask, AdBlock) into isolated environments.
 *   **Tag System**: Organize profiles with custom color tags (e.g., "TikTok", "USA", "Main Account").
-*   **Safe Identification**: Uses **Dynamic Watermark** to display profile names (e.g., `Profile-1`) at the top of the page. Replaces bookmarks bar (avoids overwriting user bookmarks) and title bar injection (avoids detection). Supports multiple styles (Standard/Minimal/Enhanced).
+*   **Safe Identification**: Uses **Dynamic Watermark** to display profile names (e.g., `Profile-1`) at the top of the page. 
 *   **Multi-Opening**: Running multiple profiles simultaneously with independent ports and processes.
 *   **Remote Debugging Port** (Advanced): Optional external Puppeteer/DevTools connection for automation.
 
@@ -92,7 +81,6 @@ Go to the [**Releases**](https://github.com/EchoHS/GeekezBrowser/releases) page 
     ```bash
     npm install
     ```
-    *Note: The `postinstall` script (`setup.js`) will automatically detect your region and download the correct `Xray-core` and `Chrome` binaries (using mirrors if in China).*
 
 3.  **Run the App**
     ```bash
@@ -103,12 +91,11 @@ Go to the [**Releases**](https://github.com/EchoHS/GeekezBrowser/releases) page 
 
 | Platform | Rating | Notes |
 | :--- | :--- | :--- |
-| **TikTok** | ✅ Safe | Canvas noise effectively prevents device association. Requires clean residential IP. |
+| **TikTok** | ✅ Safe | Canvas noise effectively prevents device association. Requires **Dedicated IP**. |
 | **Facebook** | ✅ Safe | Automation flags (WebDriver) stripped. Avoid high-frequency automation. |
 | **Shopee** | ✅ Safe | Stable fingerprint for seller center. Use fixed environment per account. |
 | **Amazon (Buyer)** | ✅ Safe | Sufficient isolation for buyer/reviewer accounts. |
-| **Amazon (Seller)** | ✅ Safe | **TLS Safe**. Usable for main accounts with **High Quality Residential IP** and fixed environment. |
-| **Cloudflare** | ✅ Pass | Successfully bypasses Turnstile via native injection strategy. |
+| **Amazon (Seller)** | ✅ Safe | **TLS Safe**. Usable for main accounts with **Dedicated IP** and fixed environment. |
 
 ## 📦 Build
 
@@ -128,14 +115,12 @@ npm run build:linux
 ## 🔍 Detection Status
 
 - ✅ **Browserscan**: All tests passed
-- ✅ **Pixelscan**: No masking detected
-- ✅ **TLS Fingerprint**: Real Chrome (identical to commercial tools)
-- ✅ **Language Spoofing**: Minimal Intl API hook, no detection
+- ✅ **Pixelscan**: All tests passed
+- ✅ **Cloudflare**: Bot test passed
 
 ## ❓ FAQ
 
 ### macOS: "App is damaged" or "Cannot be opened"
-This error occurs because apps built via GitHub Actions are not signed by an Apple Developer Certificate (requires $99/year). macOS Gatekeeper blocks them by default.
 
 **Solution**:
 1. Drag `GeekEZ Browser` into your **Applications** folder.
