@@ -62,7 +62,7 @@ jobs:
           path: dist/*.dmg
 
   build-mac-x64:
-    runs-on: macos-13  # Intel Mac runner
+    runs-on: macos-15-intel  # Intel Mac runner (updated from deprecated macos-13)
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
