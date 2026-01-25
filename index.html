@@ -1028,7 +1028,25 @@
         </div>
         <div style="display:flex; gap:10px;">
             <button class="outline" onclick="openExportModal()" data-i18n="btnExport">📤 Export</button>
-            <button class="outline" onclick="importData()" data-i18n="importYaml">📥 Import</button>
+            <div style="position: relative;">
+                <button class="outline" onclick="toggleImportMenu()" id="importBtn" data-i18n="importYaml">📥 Import
+                    ▾</button>
+                <div id="importMenu"
+                    style="display: none; position: absolute; top: 35px; right: 0; background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; min-width: 200px; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
+                    <div onclick="importFullBackup(); closeImportMenu();"
+                        style="padding: 10px 15px; cursor: pointer; font-size: 13px;"
+                        onmouseover="this.style.background='rgba(128,128,128,0.1)'"
+                        onmouseout="this.style.background='transparent'">
+                        🔐 导入完整备份 (.geekez)
+                    </div>
+                    <div onclick="importData(); closeImportMenu();"
+                        style="padding: 10px 15px; cursor: pointer; border-bottom: 1px solid var(--border); font-size: 13px;"
+                        onmouseover="this.style.background='rgba(128,128,128,0.1)'"
+                        onmouseout="this.style.background='transparent'">
+                        📄 导入 YAML 配置
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -1203,23 +1221,94 @@
         <div class="modal-content">
             <div class="modal-header"><span data-i18n="exportTitle">Export</span><span style="cursor:pointer"
                     onclick="closeExportModal()">✕</span></div>
-            <div class="export-option" onclick="exportData('all')">
+            <div class="export-option" onclick="openExportSelectModal('full-backup')">
                 <div>
-                    <div class="export-title" data-i18n="expAll">All</div>
-                    <div class="export-desc" data-i18n="expAllDesc">Full</div>
+                    <div class="export-title" style="color: var(--accent);" data-i18n="expFullBackup">🔐 完整备份（全部）</div>
+                    <div class="export-desc" data-i18n="expFullBackupDesc">含浏览器数据（Cookie/密码/书签），AES-256加密</div>
+                </div><span>🔒</span>
+            </div>
+            <div class="export-option" onclick="openExportSelectModal('all')">
+                <div>
+                    <div class="export-title" data-i18n="expAllProfiles">完整备份（指纹环境）</div>
+                    <div class="export-desc" data-i18n="expAllProfilesDesc">导出指纹配置 + 前置代理（不含浏览器数据）</div>
                 </div><span>📦</span>
             </div>
-            <div class="export-option" onclick="exportData('proxies')">
+            <div class="export-option" onclick="openExportSelectModal('proxies')">
                 <div>
-                    <div class="export-title" data-i18n="expProxies">Proxies</div>
-                    <div class="export-desc" data-i18n="expProxiesDesc">Proxies</div>
+                    <div class="export-title" data-i18n="expProxies">前置代理</div>
+                    <div class="export-desc" data-i18n="expProxiesDesc">导出手动节点和订阅配置</div>
                 </div><span>🔗</span>
             </div>
-            <div class="export-option" onclick="exportData('profiles')">
+            <div class="export-option" onclick="openExportSelectModal('profiles')">
                 <div>
-                    <div class="export-title" data-i18n="expProfiles">Profiles</div>
-                    <div class="export-desc" data-i18n="expProfilesDesc">Profiles</div>
+                    <div class="export-title" data-i18n="expProfiles">指纹环境</div>
+                    <div class="export-desc" data-i18n="expProfilesDesc">仅导出环境指纹配置</div>
                 </div><span>👤</span>
+            </div>
+        </div>
+    </div>
+    <!-- 导出环境选择模态框 -->
+    <div id="exportSelectModal" class="modal-overlay" style="z-index: 2300;">
+        <div class="modal-content" style="width: 480px; max-width: 90vw;">
+            <div class="modal-header" style="border-bottom: 1px solid var(--border); padding-bottom: 12px;">
+                <span id="exportSelectTitle"
+                    style="font-size: 16px; font-weight: 600; display: flex; align-items: center; gap: 8px;">
+                    <span style="color: var(--accent);">📦</span>
+                    <span data-i18n="expSelectTitle">选择要导出的环境</span>
+                </span>
+                <span style="cursor:pointer; padding: 4px 8px; border-radius: 4px; transition: background 0.15s;"
+                    onmouseover="this.style.background='rgba(255,255,255,0.1)'"
+                    onmouseout="this.style.background='transparent'" onclick="closeExportSelectModal()">✕</span>
+            </div>
+            <div class="modal-body" style="padding: 16px 0;">
+                <!-- 顶部控制栏 -->
+                <div
+                    style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; padding: 8px 12px; background: rgba(0,255,255,0.05); border-radius: 8px; border: 1px solid rgba(0,255,255,0.1);">
+                    <label
+                        style="display: flex; align-items: center; gap: 10px; cursor: pointer; white-space: nowrap; font-size: 13px;">
+                        <input type="checkbox" id="exportSelectAll" checked onchange="toggleExportSelectAll()"
+                            style="width: 18px; height: 18px; accent-color: var(--accent); cursor: pointer;">
+                        <span data-i18n="expSelectAll" style="font-weight: 500;">全选</span>
+                    </label>
+                    <div style="display: flex; align-items: center; gap: 6px;">
+                        <span id="exportSelectedCount"
+                            style="font-size: 12px; color: var(--accent); font-weight: 600; background: rgba(0,255,255,0.1); padding: 4px 10px; border-radius: 12px;">0/0</span>
+                        <span style="font-size: 12px; color: var(--text-secondary);" data-i18n="expSelected">已选择</span>
+                    </div>
+                </div>
+                <!-- 环境列表 -->
+                <div id="exportProfileList"
+                    style="max-height: 320px; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px; padding: 8px; background: rgba(0,0,0,0.2);">
+                </div>
+            </div>
+            <div class="modal-footer"
+                style="display: flex; justify-content: flex-end; gap: 12px; padding-top: 12px; border-top: 1px solid var(--border);">
+                <button class="outline" onclick="closeExportSelectModal()" data-i18n="cancel"
+                    style="padding: 8px 20px;">取消</button>
+                <button onclick="confirmExport()" data-i18n="expConfirm"
+                    style="padding: 8px 24px; background: var(--accent); color: var(--bg-color); font-weight: 600;">导出</button>
+            </div>
+        </div>
+    </div>
+    <!-- 密码输入模态框 -->
+    <div id="passwordModal" class="modal-overlay" style="z-index: 2400;">
+        <div class="modal-content" style="width: 380px;">
+            <div class="modal-header">
+                <span id="passwordModalTitle">设置备份密码</span>
+                <span style="cursor:pointer" onclick="closePasswordModal()">✕</span>
+            </div>
+            <div class="modal-body">
+                <p style="font-size: 12px; color: var(--text-secondary); margin-bottom: 15px;">
+                    完整备份包含敏感数据（Cookie、密码等），将使用 AES-256 加密保护。
+                </p>
+                <label style="font-size: 12px;">密码</label>
+                <input type="password" id="backupPassword" placeholder="请输入密码" style="margin-bottom: 10px;">
+                <label style="font-size: 12px;" id="confirmPasswordLabel">确认密码</label>
+                <input type="password" id="backupPasswordConfirm" placeholder="请再次输入密码">
+            </div>
+            <div class="modal-footer" style="display: flex; justify-content: flex-end; gap: 10px;">
+                <button class="outline" onclick="closePasswordModal()">取消</button>
+                <button onclick="submitPassword()">确定</button>
             </div>
         </div>
     </div>

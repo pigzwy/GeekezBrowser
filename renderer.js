@@ -993,15 +993,264 @@ function updateToolbar() {
     d.innerText = `${modeText} [${count}]`;
 }
 
-// Export Logic
-function openExportModal() { document.getElementById('exportModal').style.display = 'flex'; } // flex
+// Export Logic (重构版)
+let exportType = '';
+let selectedProfileIds = [];
+let passwordCallback = null;
+let isImportMode = false;
+
+function openExportModal() { document.getElementById('exportModal').style.display = 'flex'; }
 function closeExportModal() { document.getElementById('exportModal').style.display = 'none'; }
-async function exportData(type) {
+
+async function openExportSelectModal(type) {
+    exportType = type;
     closeExportModal();
-    try {
-        const result = await window.electronAPI.invoke('export-data', type);
-        if (result) showAlert(t('msgExportSuccess')); else showAlert(t('msgNoData'));
-    } catch (e) { showAlert("Export Failed: " + e.message); }
+
+    // 如果是仅导出代理，不需要选择环境
+    if (type === 'proxies') {
+        try {
+            const result = await window.electronAPI.invoke('export-selected-data', { type: 'proxies', profileIds: [] });
+            if (result.success) showAlert(t('msgExportSuccess'));
+            else if (!result.cancelled) showAlert(result.error || t('msgNoData'));
+        } catch (e) { showAlert("Export Failed: " + e.message); }
+        return;
+    }
+
+    // 获取环境列表
+    const profiles = await window.electronAPI.invoke('get-export-profiles');
+
+    if (profiles.length === 0) {
+        showAlert(t('expNoProfiles'));
+        return;
+    }
+
+    // 渲染选择器
+    renderExportProfileList(profiles);
+
+    // 默认全选
+    selectedProfileIds = profiles.map(p => p.id);
+    document.getElementById('exportSelectAll').checked = true;
+    updateExportSelectedCount(profiles.length);
+
+    // 更新标题（使用 i18n）
+    const titleSpan = document.querySelector('#exportSelectTitle span[data-i18n]');
+    const iconSpan = document.querySelector('#exportSelectTitle span:first-child');
+    if (type === 'full-backup') {
+        if (titleSpan) titleSpan.innerText = t('expSelectTitleFull');
+        if (iconSpan) iconSpan.innerText = '🔐';
+    } else {
+        if (titleSpan) titleSpan.innerText = t('expSelectTitle');
+        if (iconSpan) iconSpan.innerText = '📦';
+    }
+
+    document.getElementById('exportSelectModal').style.display = 'flex';
+}
+
+function closeExportSelectModal() {
+    document.getElementById('exportSelectModal').style.display = 'none';
+    selectedProfileIds = [];
+}
+
+function renderExportProfileList(profiles) {
+    const container = document.getElementById('exportProfileList');
+    if (!profiles || profiles.length === 0) {
+        container.innerHTML = `<div style="padding: 30px; text-align: center; color: var(--text-secondary);">
+            <div style="font-size: 24px; margin-bottom: 8px;">📭</div>
+            <div>${t('expNoProfiles')}</div>
+        </div>`;
+        return;
+    }
+
+    let html = '';
+    for (const p of profiles) {
+        const tagsHtml = (p.tags || []).map(tag =>
+            `<span style="font-size: 9px; padding: 2px 6px; background: ${stringToColor(tag)}22; color: ${stringToColor(tag)}; border-radius: 4px; margin-left: 6px; font-weight: 500;">${tag}</span>`
+        ).join('');
+
+        html += `<label style="display: flex; align-items: center; padding: 10px 12px; margin: 4px 0; background: rgba(255,255,255,0.03); border: 1px solid transparent; border-radius: 8px; cursor: pointer; transition: all 0.15s ease;" 
+            onmouseover="this.style.background='rgba(0,255,255,0.05)'; this.style.borderColor='var(--accent)';" 
+            onmouseout="this.style.background='rgba(255,255,255,0.03)'; this.style.borderColor='transparent';">
+            <input type="checkbox" id="export-${p.id}" checked 
+                onchange="handleExportCheckboxChange('${p.id}', this.checked)"
+                style="width: 18px; height: 18px; margin-right: 12px; cursor: pointer; accent-color: var(--accent); flex-shrink: 0;">
+            <div style="flex: 1; min-width: 0;">
+                <div style="font-size: 13px; font-weight: 500; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${p.name || t('expNoProfiles')}</div>
+            </div>
+            <div style="display: flex; align-items: center; flex-shrink: 0;">${tagsHtml}</div>
+        </label>`;
+    }
+    container.innerHTML = html;
+}
+
+// 处理单个 checkbox 变化
+function handleExportCheckboxChange(id, checked) {
+    if (checked) {
+        if (!selectedProfileIds.includes(id)) selectedProfileIds.push(id);
+    } else {
+        selectedProfileIds = selectedProfileIds.filter(pid => pid !== id);
+    }
+
+    // 更新全选状态
+    const allCheckboxes = document.querySelectorAll('#exportProfileList input[type="checkbox"]');
+    const allChecked = Array.from(allCheckboxes).every(cb => cb.checked);
+    document.getElementById('exportSelectAll').checked = allChecked;
+
+    updateExportSelectedCount(allCheckboxes.length);
+}
+
+function toggleExportProfile(id) {
+    const checkbox = document.getElementById(`export-${id}`);
+    checkbox.checked = !checkbox.checked;
+
+    if (checkbox.checked) {
+        if (!selectedProfileIds.includes(id)) selectedProfileIds.push(id);
+    } else {
+        selectedProfileIds = selectedProfileIds.filter(pid => pid !== id);
+    }
+
+    // 更新全选状态
+    const allCheckboxes = document.querySelectorAll('#exportProfileList input[type="checkbox"]');
+    const allChecked = Array.from(allCheckboxes).every(cb => cb.checked);
+    document.getElementById('exportSelectAll').checked = allChecked;
+
+    updateExportSelectedCount(allCheckboxes.length);
+}
+
+function toggleExportSelectAll() {
+    const selectAll = document.getElementById('exportSelectAll').checked;
+    const checkboxes = document.querySelectorAll('#exportProfileList input[type="checkbox"]');
+
+    checkboxes.forEach(cb => {
+        cb.checked = selectAll;
+        const id = cb.id.replace('export-', '');
+        if (selectAll) {
+            if (!selectedProfileIds.includes(id)) selectedProfileIds.push(id);
+        }
+    });
+
+    if (!selectAll) selectedProfileIds = [];
+
+    updateExportSelectedCount(checkboxes.length);
+}
+
+function updateExportSelectedCount(total) {
+    document.getElementById('exportSelectedCount').innerText = `${selectedProfileIds.length}/${total}`;
+}
+
+async function confirmExport() {
+    if (selectedProfileIds.length === 0) {
+        showAlert('请至少选择一个环境');
+        return;
+    }
+
+    // 保存选中的 ID（因为 closeExportSelectModal 会清空）
+    const idsToExport = [...selectedProfileIds];
+    const typeToExport = exportType;
+
+    closeExportSelectModal();
+
+    if (typeToExport === 'full-backup') {
+        // 保存到全局变量供密码提交后使用
+        selectedProfileIds = idsToExport;
+        isImportMode = false;
+        openPasswordModal('设置备份密码', true);
+    } else {
+        // 直接导出
+        try {
+            const result = await window.electronAPI.invoke('export-selected-data', {
+                type: typeToExport,
+                profileIds: idsToExport
+            });
+            if (result.success) {
+                showAlert(`导出成功！共 ${result.count} 个环境`);
+            } else if (!result.cancelled) {
+                showAlert(result.error || t('msgNoData'));
+            }
+        } catch (e) {
+            showAlert("Export Failed: " + e.message);
+        }
+    }
+}
+
+// 密码模态框
+function openPasswordModal(title, showConfirm) {
+    document.getElementById('passwordModalTitle').innerText = title;
+    document.getElementById('backupPassword').value = '';
+    document.getElementById('backupPasswordConfirm').value = '';
+
+    // 导入时不需要确认密码
+    const confirmLabel = document.getElementById('confirmPasswordLabel');
+    const confirmInput = document.getElementById('backupPasswordConfirm');
+    if (showConfirm) {
+        confirmLabel.style.display = 'block';
+        confirmInput.style.display = 'block';
+    } else {
+        confirmLabel.style.display = 'none';
+        confirmInput.style.display = 'none';
+    }
+
+    document.getElementById('passwordModal').style.display = 'flex';
+    document.getElementById('backupPassword').focus();
+}
+
+function closePasswordModal() {
+    document.getElementById('passwordModal').style.display = 'none';
+    passwordCallback = null;
+}
+
+async function submitPassword() {
+    const password = document.getElementById('backupPassword').value;
+    const confirmPassword = document.getElementById('backupPasswordConfirm').value;
+
+    if (!password) {
+        showAlert('请输入密码');
+        return;
+    }
+
+    if (!isImportMode && password !== confirmPassword) {
+        showAlert('两次输入的密码不一致');
+        return;
+    }
+
+    if (password.length < 4) {
+        showAlert('密码长度至少 4 位');
+        return;
+    }
+
+    closePasswordModal();
+
+    if (isImportMode) {
+        // 导入完整备份
+        try {
+            const result = await window.electronAPI.invoke('import-full-backup', { password });
+            if (result.success) {
+                showAlert(`导入成功！共 ${result.count} 个环境`);
+                loadProfiles();
+                globalSettings = await window.electronAPI.getSettings();
+                renderGroupTabs();
+                updateToolbar();
+            } else if (!result.cancelled) {
+                showAlert(result.error || '导入失败');
+            }
+        } catch (e) {
+            showAlert("Import Failed: " + e.message);
+        }
+    } else {
+        // 导出完整备份
+        try {
+            const result = await window.electronAPI.invoke('export-full-backup', {
+                profileIds: selectedProfileIds,
+                password
+            });
+            if (result.success) {
+                showAlert(`完整备份成功！共 ${result.count} 个环境`);
+            } else if (!result.cancelled) {
+                showAlert(result.error || '备份失败');
+            }
+        } catch (e) {
+            showAlert("Backup Failed: " + e.message);
+        }
+    }
 }
 
 // Import Logic
@@ -1017,6 +1266,31 @@ async function importData() {
         }
     } catch (e) { showAlert("Import Failed: " + e.message); }
 }
+
+// 导入完整备份（.geekez 文件）
+async function importFullBackup() {
+    isImportMode = true;
+    openPasswordModal('输入备份密码', false);
+}
+
+// Import Menu Toggle
+function toggleImportMenu() {
+    const menu = document.getElementById('importMenu');
+    menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
+}
+
+function closeImportMenu() {
+    document.getElementById('importMenu').style.display = 'none';
+}
+
+// 点击其他地方关闭菜单
+document.addEventListener('click', (e) => {
+    const menu = document.getElementById('importMenu');
+    const btn = document.getElementById('importBtn');
+    if (menu && btn && !menu.contains(e.target) && !btn.contains(e.target)) {
+        menu.style.display = 'none';
+    }
+});
 
 function openImportSub() { showInput(t('importSubTitle'), importSubscription); }
 async function importSubscription(url) {

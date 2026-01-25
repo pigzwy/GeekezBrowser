@@ -10,6 +10,11 @@ const { SocksProxyAgent } = require('socks-proxy-agent');
 const http = require('http');
 const https = require('https');
 const os = require('os');
+const crypto = require('crypto');
+const zlib = require('zlib');
+const { promisify } = require('util');
+const gzip = promisify(zlib.gzip);
+const gunzip = promisify(zlib.gunzip);
 
 
 // Hardware acceleration enabled for better UI performance
@@ -368,8 +373,403 @@ ipcMain.handle('get-user-extensions', async () => {
     return settings.userExtensions || [];
 });
 ipcMain.handle('open-url', async (e, url) => { await shell.openExternal(url); });
-ipcMain.handle('export-data', async (e, type) => { const profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : []; const settings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], subscriptions: [] }; let exportObj = {}; if (type === 'all' || type === 'profiles') exportObj.profiles = profiles; if (type === 'all' || type === 'proxies') { exportObj.preProxies = settings.preProxies || []; exportObj.subscriptions = settings.subscriptions || []; } if (Object.keys(exportObj).length === 0) return false; const { filePath } = await dialog.showSaveDialog({ title: 'Export Data', defaultPath: `GeekEZ_Backup_${type}_${Date.now()}.yaml`, filters: [{ name: 'YAML', extensions: ['yml', 'yaml'] }] }); if (filePath) { await fs.writeFile(filePath, yaml.dump(exportObj)); return true; } return false; });
-ipcMain.handle('import-data', async () => { const { filePaths } = await dialog.showOpenDialog({ properties: ['openFile'], filters: [{ name: 'YAML', extensions: ['yml', 'yaml'] }] }); if (filePaths && filePaths.length > 0) { try { const content = await fs.readFile(filePaths[0], 'utf8'); const data = yaml.load(content); let updated = false; if (data.profiles || data.preProxies || data.subscriptions) { if (Array.isArray(data.profiles)) { const currentProfiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : []; data.profiles.forEach(p => { const idx = currentProfiles.findIndex(cp => cp.id === p.id); if (idx > -1) currentProfiles[idx] = p; else { if (!p.id) p.id = uuidv4(); currentProfiles.push(p); } }); await fs.writeJson(PROFILES_FILE, currentProfiles); updated = true; } if (Array.isArray(data.preProxies) || Array.isArray(data.subscriptions)) { const currentSettings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], subscriptions: [] }; if (data.preProxies) { if (!currentSettings.preProxies) currentSettings.preProxies = []; data.preProxies.forEach(p => { if (!currentSettings.preProxies.find(cp => cp.id === p.id)) currentSettings.preProxies.push(p); }); } if (data.subscriptions) { if (!currentSettings.subscriptions) currentSettings.subscriptions = []; data.subscriptions.forEach(s => { if (!currentSettings.subscriptions.find(cs => cs.id === s.id)) currentSettings.subscriptions.push(s); }); } await fs.writeJson(SETTINGS_FILE, currentSettings); updated = true; } } else if (data.name && data.proxyStr && data.fingerprint) { const profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : []; const newProfile = { ...data, id: uuidv4(), isSetup: false, createdAt: Date.now() }; profiles.push(newProfile); await fs.writeJson(PROFILES_FILE, profiles); updated = true; } return updated; } catch (e) { console.error(e); throw e; } } return false; });
+
+// --- 导出/导入功能 (重构版) ---
+
+// 辅助函数：清理 fingerprint 中的无用字段
+function cleanFingerprint(fp) {
+    if (!fp) return fp;
+    const cleaned = { ...fp };
+    delete cleaned.userAgent;
+    delete cleaned.userAgentMetadata;
+    delete cleaned.webgl;
+    return cleaned;
+}
+
+// 加密辅助函数
+const ENCRYPTION_ALGORITHM = 'aes-256-gcm';
+const PBKDF2_ITERATIONS = 100000;
+const SALT_LENGTH = 16;
+const IV_LENGTH = 12;
+const AUTH_TAG_LENGTH = 16;
+const MAGIC_HEADER = Buffer.from('GKEZ'); // GeekEZ magic bytes
+
+function deriveKey(password, salt) {
+    return crypto.pbkdf2Sync(password, salt, PBKDF2_ITERATIONS, 32, 'sha256');
+}
+
+function encryptData(data, password) {
+    const salt = crypto.randomBytes(SALT_LENGTH);
+    const iv = crypto.randomBytes(IV_LENGTH);
+    const key = deriveKey(password, salt);
+
+    const cipher = crypto.createCipheriv(ENCRYPTION_ALGORITHM, key, iv);
+    const encrypted = Buffer.concat([cipher.update(data), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+
+    // 格式: MAGIC(4) + VERSION(4) + SALT(16) + IV(12) + AUTH_TAG(16) + ENCRYPTED_DATA
+    const version = Buffer.alloc(4);
+    version.writeUInt32LE(1, 0); // Version 1
+
+    return Buffer.concat([MAGIC_HEADER, version, salt, iv, authTag, encrypted]);
+}
+
+function decryptData(encryptedBuffer, password) {
+    // 验证 magic header
+    const magic = encryptedBuffer.slice(0, 4);
+    if (!magic.equals(MAGIC_HEADER)) {
+        throw new Error('Invalid backup file format');
+    }
+
+    let offset = 4;
+    const version = encryptedBuffer.readUInt32LE(offset);
+    offset += 4;
+
+    if (version !== 1) {
+        throw new Error(`Unsupported backup version: ${version}`);
+    }
+
+    const salt = encryptedBuffer.slice(offset, offset + SALT_LENGTH);
+    offset += SALT_LENGTH;
+
+    const iv = encryptedBuffer.slice(offset, offset + IV_LENGTH);
+    offset += IV_LENGTH;
+
+    const authTag = encryptedBuffer.slice(offset, offset + AUTH_TAG_LENGTH);
+    offset += AUTH_TAG_LENGTH;
+
+    const encrypted = encryptedBuffer.slice(offset);
+
+    const key = deriveKey(password, salt);
+    const decipher = crypto.createDecipheriv(ENCRYPTION_ALGORITHM, key, iv);
+    decipher.setAuthTag(authTag);
+
+    return Buffer.concat([decipher.update(encrypted), decipher.final()]);
+}
+
+// 获取用于选择器的环境列表
+ipcMain.handle('get-export-profiles', async () => {
+    const profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
+    return profiles.map(p => ({ id: p.id, name: p.name, tags: p.tags || [] }));
+});
+
+// 导出选定环境 (精简版，不含浏览器数据)
+ipcMain.handle('export-selected-data', async (e, { type, profileIds }) => {
+    const allProfiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
+    const settings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], subscriptions: [] };
+
+    // 过滤选中的环境
+    const selectedProfiles = allProfiles
+        .filter(p => profileIds.includes(p.id))
+        .map(p => ({
+            ...p,
+            fingerprint: cleanFingerprint(p.fingerprint)
+        }));
+
+    let exportObj = {};
+
+    if (type === 'all' || type === 'profiles') {
+        exportObj.profiles = selectedProfiles;
+    }
+    if (type === 'all' || type === 'proxies') {
+        exportObj.preProxies = settings.preProxies || [];
+        exportObj.subscriptions = settings.subscriptions || [];
+    }
+
+    if (Object.keys(exportObj).length === 0) return { success: false, error: 'No data to export' };
+
+    const typeNames = { all: 'profiles', profiles: 'profiles', proxies: 'proxies' };
+    const { filePath } = await dialog.showSaveDialog({
+        title: 'Export Data',
+        defaultPath: `GeekEZ_Backup_${typeNames[type] || type}_${Date.now()}.yaml`,
+        filters: [{ name: 'YAML', extensions: ['yml', 'yaml'] }]
+    });
+
+    if (filePath) {
+        await fs.writeFile(filePath, yaml.dump(exportObj));
+        return { success: true, count: selectedProfiles.length };
+    }
+    return { success: false, cancelled: true };
+});
+
+// 完整备份 (含浏览器数据，加密)
+ipcMain.handle('export-full-backup', async (e, { profileIds, password }) => {
+    try {
+        const allProfiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
+        const settings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], subscriptions: [] };
+
+        // 过滤选中的环境
+        const selectedProfiles = allProfiles
+            .filter(p => profileIds.includes(p.id))
+            .map(p => ({
+                ...p,
+                fingerprint: cleanFingerprint(p.fingerprint)
+            }));
+
+        // 准备备份数据
+        const backupData = {
+            version: 1,
+            createdAt: Date.now(),
+            profiles: selectedProfiles,
+            preProxies: settings.preProxies || [],
+            subscriptions: settings.subscriptions || [],
+            browserData: {}
+        };
+
+        // 收集浏览器数据
+        // 浏览器数据存储在 DATA_PATH/<profileId>/browser_data/Default/
+        for (const profile of selectedProfiles) {
+            const profileDataDir = path.join(DATA_PATH, profile.id, 'browser_data');
+            if (fs.existsSync(profileDataDir)) {
+                const defaultDir = path.join(profileDataDir, 'Default');
+                if (fs.existsSync(defaultDir)) {
+                    const browserFiles = {};
+
+                    // 收集关键浏览器数据文件
+                    const filesToBackup = ['Bookmarks', 'Cookies', 'Login Data', 'Web Data', 'Preferences'];
+                    for (const fileName of filesToBackup) {
+                        const filePath = path.join(defaultDir, fileName);
+                        if (fs.existsSync(filePath)) {
+                            try {
+                                const content = await fs.readFile(filePath);
+                                browserFiles[fileName] = content.toString('base64');
+                            } catch (err) {
+                                console.error(`Failed to read ${fileName} for ${profile.id}:`, err.message);
+                            }
+                        }
+                    }
+
+                    // 收集 Local Storage
+                    const localStorageDir = path.join(defaultDir, 'Local Storage', 'leveldb');
+                    if (fs.existsSync(localStorageDir)) {
+                        try {
+                            const lsFiles = await fs.readdir(localStorageDir);
+                            const localStorageData = {};
+                            for (const lsFile of lsFiles) {
+                                if (lsFile.endsWith('.ldb') || lsFile.endsWith('.log')) {
+                                    const lsFilePath = path.join(localStorageDir, lsFile);
+                                    const content = await fs.readFile(lsFilePath);
+                                    localStorageData[lsFile] = content.toString('base64');
+                                }
+                            }
+                            if (Object.keys(localStorageData).length > 0) {
+                                browserFiles['LocalStorage'] = localStorageData;
+                            }
+                        } catch (err) {
+                            console.error(`Failed to read LocalStorage for ${profile.id}:`, err.message);
+                        }
+                    }
+
+                    if (Object.keys(browserFiles).length > 0) {
+                        backupData.browserData[profile.id] = browserFiles;
+                    }
+                }
+            }
+        }
+
+        // 压缩并加密
+        const jsonData = JSON.stringify(backupData);
+        const compressed = await gzip(Buffer.from(jsonData, 'utf8'));
+        const encrypted = encryptData(compressed, password);
+
+        const { filePath } = await dialog.showSaveDialog({
+            title: 'Export Full Backup',
+            defaultPath: `GeekEZ_FullBackup_${Date.now()}.geekez`,
+            filters: [{ name: 'GeekEZ Backup', extensions: ['geekez'] }]
+        });
+
+        if (filePath) {
+            await fs.writeFile(filePath, encrypted);
+            return { success: true, count: selectedProfiles.length };
+        }
+        return { success: false, cancelled: true };
+    } catch (err) {
+        console.error('Full backup failed:', err);
+        return { success: false, error: err.message };
+    }
+});
+
+// 导入完整备份
+ipcMain.handle('import-full-backup', async (e, { password }) => {
+    try {
+        const { filePaths } = await dialog.showOpenDialog({
+            properties: ['openFile'],
+            filters: [{ name: 'GeekEZ Backup', extensions: ['geekez'] }]
+        });
+
+        if (!filePaths || filePaths.length === 0) {
+            return { success: false, cancelled: true };
+        }
+
+        const encrypted = await fs.readFile(filePaths[0]);
+        const decrypted = decryptData(encrypted, password);
+        const decompressed = await gunzip(decrypted);
+        const backupData = JSON.parse(decompressed.toString('utf8'));
+
+        if (backupData.version !== 1) {
+            throw new Error(`Unsupported backup version: ${backupData.version}`);
+        }
+
+        // 还原 profiles
+        const currentProfiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
+        let importedCount = 0;
+
+        for (const profile of backupData.profiles) {
+            const idx = currentProfiles.findIndex(cp => cp.id === profile.id);
+            if (idx > -1) {
+                currentProfiles[idx] = profile;
+            } else {
+                currentProfiles.push(profile);
+            }
+            importedCount++;
+        }
+        await fs.writeJson(PROFILES_FILE, currentProfiles);
+
+        // 还原代理和订阅
+        const currentSettings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], subscriptions: [] };
+        if (backupData.preProxies) {
+            if (!currentSettings.preProxies) currentSettings.preProxies = [];
+            for (const p of backupData.preProxies) {
+                if (!currentSettings.preProxies.find(cp => cp.id === p.id)) {
+                    currentSettings.preProxies.push(p);
+                }
+            }
+        }
+        if (backupData.subscriptions) {
+            if (!currentSettings.subscriptions) currentSettings.subscriptions = [];
+            for (const s of backupData.subscriptions) {
+                if (!currentSettings.subscriptions.find(cs => cs.id === s.id)) {
+                    currentSettings.subscriptions.push(s);
+                }
+            }
+        }
+        await fs.writeJson(SETTINGS_FILE, currentSettings);
+
+        // 还原浏览器数据
+        // 浏览器数据存储在 DATA_PATH/<profileId>/browser_data/Default/
+        for (const [profileId, browserFiles] of Object.entries(backupData.browserData || {})) {
+            const profileDataDir = path.join(DATA_PATH, profileId, 'browser_data');
+            const defaultDir = path.join(profileDataDir, 'Default');
+            await fs.ensureDir(defaultDir);
+
+            for (const [fileName, content] of Object.entries(browserFiles)) {
+                if (fileName === 'LocalStorage') {
+                    // 还原 Local Storage
+                    const localStorageDir = path.join(defaultDir, 'Local Storage', 'leveldb');
+                    await fs.ensureDir(localStorageDir);
+                    for (const [lsFileName, lsContent] of Object.entries(content)) {
+                        const lsFilePath = path.join(localStorageDir, lsFileName);
+                        await fs.writeFile(lsFilePath, Buffer.from(lsContent, 'base64'));
+                    }
+                } else {
+                    // 还原普通文件
+                    const filePath = path.join(defaultDir, fileName);
+                    await fs.writeFile(filePath, Buffer.from(content, 'base64'));
+                }
+            }
+        }
+
+        return { success: true, count: importedCount };
+    } catch (err) {
+        console.error('Import full backup failed:', err);
+        if (err.message.includes('Unsupported state') || err.message.includes('bad decrypt')) {
+            return { success: false, error: '密码错误或文件已损坏' };
+        }
+        return { success: false, error: err.message };
+    }
+});
+
+// 导入普通备份 (YAML)
+ipcMain.handle('import-data', async () => {
+    const { filePaths } = await dialog.showOpenDialog({
+        properties: ['openFile'],
+        filters: [{ name: 'YAML', extensions: ['yml', 'yaml'] }]
+    });
+
+    if (filePaths && filePaths.length > 0) {
+        try {
+            const content = await fs.readFile(filePaths[0], 'utf8');
+            const data = yaml.load(content);
+            let updated = false;
+
+            if (data.profiles || data.preProxies || data.subscriptions) {
+                if (Array.isArray(data.profiles)) {
+                    const currentProfiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
+                    data.profiles.forEach(p => {
+                        const idx = currentProfiles.findIndex(cp => cp.id === p.id);
+                        if (idx > -1) currentProfiles[idx] = p;
+                        else {
+                            if (!p.id) p.id = uuidv4();
+                            currentProfiles.push(p);
+                        }
+                    });
+                    await fs.writeJson(PROFILES_FILE, currentProfiles);
+                    updated = true;
+                }
+                if (Array.isArray(data.preProxies) || Array.isArray(data.subscriptions)) {
+                    const currentSettings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], subscriptions: [] };
+                    if (data.preProxies) {
+                        if (!currentSettings.preProxies) currentSettings.preProxies = [];
+                        data.preProxies.forEach(p => {
+                            if (!currentSettings.preProxies.find(cp => cp.id === p.id)) currentSettings.preProxies.push(p);
+                        });
+                    }
+                    if (data.subscriptions) {
+                        if (!currentSettings.subscriptions) currentSettings.subscriptions = [];
+                        data.subscriptions.forEach(s => {
+                            if (!currentSettings.subscriptions.find(cs => cs.id === s.id)) currentSettings.subscriptions.push(s);
+                        });
+                    }
+                    await fs.writeJson(SETTINGS_FILE, currentSettings);
+                    updated = true;
+                }
+            } else if (data.name && data.proxyStr && data.fingerprint) {
+                // 单个环境导入
+                const profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
+                const newProfile = { ...data, id: uuidv4(), isSetup: false, createdAt: Date.now() };
+                profiles.push(newProfile);
+                await fs.writeJson(PROFILES_FILE, profiles);
+                updated = true;
+            }
+            return updated;
+        } catch (e) {
+            console.error(e);
+            throw e;
+        }
+    }
+    return false;
+});
+
+// 保留旧的 export-data 用于向后兼容 (deprecated)
+ipcMain.handle('export-data', async (e, type) => {
+    const profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
+    const settings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], subscriptions: [] };
+
+    // 清理 fingerprint
+    const cleanedProfiles = profiles.map(p => ({
+        ...p,
+        fingerprint: cleanFingerprint(p.fingerprint)
+    }));
+
+    let exportObj = {};
+    if (type === 'all' || type === 'profiles') exportObj.profiles = cleanedProfiles;
+    if (type === 'all' || type === 'proxies') {
+        exportObj.preProxies = settings.preProxies || [];
+        exportObj.subscriptions = settings.subscriptions || [];
+    }
+    if (Object.keys(exportObj).length === 0) return false;
+
+    const { filePath } = await dialog.showSaveDialog({
+        title: 'Export Data',
+        defaultPath: `GeekEZ_Backup_${type}_${Date.now()}.yaml`,
+        filters: [{ name: 'YAML', extensions: ['yml', 'yaml'] }]
+    });
+    if (filePath) {
+        await fs.writeFile(filePath, yaml.dump(exportObj));
+        return true;
+    }
+    return false;
+});
 
 // --- 核心启动逻辑 ---
 ipcMain.handle('launch-profile', async (event, profileId, watermarkStyle) => {

@@ -9,5 +9,7 @@ _Trash_Bin/
 Thumbs.db
 resources/bin/
 resources/puppeteer/
+website/
+tools/
 *.log
 *.exe
