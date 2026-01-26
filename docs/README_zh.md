@@ -130,3 +130,10 @@ npm run build:linux
 ## ⚠️ 免责声明
 
 本软件仅供技术研究与教育使用。开发者不对因使用本软件导致的账号封禁、法律风险或经济损失承担任何责任。请用户严格遵守各平台的使用规则和当地法律法规。
+
+## 📝 许可协议
+
+本软件遵循 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) 许可协议。
+
+## 💬 交流群
+[*QQ群：1079216892*](tencent://groupwpa/?subcmd=all&uin=1079216892)

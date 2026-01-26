@@ -143,3 +143,10 @@ This project is licensed under [CC BY-NC-SA 4.0](https://creativecommons.org/lic
 ## ⚠️ Disclaimer
 
 This tool is provided for educational and research purposes only. The developers are not responsible for any account bans or legal issues resulting from the use of this software. Please comply with the terms of service of the platforms you use.
+
+## 📝 License
+
+This project is licensed under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/).
+
+## 💬 Community
+[*QQ Group：1079216892*](tencent://groupwpa/?subcmd=all&uin=1079216892)
