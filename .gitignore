@@ -13,3 +13,4 @@ website/
 tools/
 *.log
 *.exe
+/venv

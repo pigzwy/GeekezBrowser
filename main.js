@@ -1,4 +1,4 @@
-﻿const { app, BrowserWindow, ipcMain, dialog, screen, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, screen, shell } = require('electron');
 const path = require('path');
 const fs = require('fs-extra');
 const { spawn, exec } = require('child_process');
@@ -425,6 +425,10 @@ function forceKill(pid) {
 
 function getChromiumPath() {
     const basePath = isDev ? path.join(__dirname, 'resources', 'puppeteer') : path.join(process.resourcesPath, 'puppeteer');
+
+    const envPath = process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROME_PATH;
+    if (envPath && fs.existsSync(envPath)) return envPath;
+
     if (!fs.existsSync(basePath)) return null;
     function findFile(dir, filename) {
         try {
@@ -432,18 +436,291 @@ function getChromiumPath() {
             for (const file of files) {
                 const fullPath = path.join(dir, file);
                 const stat = fs.statSync(fullPath);
-                if (stat.isDirectory()) { const res = findFile(fullPath, filename); if (res) return res; }
-                else if (file === filename) return fullPath;
+                if (stat.isDirectory()) {
+                    const res = findFile(fullPath, filename);
+                    if (res) return res;
+                } else if (file === filename) {
+                    return fullPath;
+                }
             }
-        } catch (e) { return null; } return null;
+        } catch (e) {
+            return null;
+        }
+        return null;
     }
 
     // macOS: Chrome binary is inside .app/Contents/MacOS/
     if (process.platform === 'darwin') {
         return findFile(basePath, 'Google Chrome for Testing');
     }
+
     // Windows
-    return findFile(basePath, 'chrome.exe');
+    if (process.platform === 'win32') {
+        return findFile(basePath, 'chrome.exe');
+    }
+
+    return findFile(basePath, 'chrome');
+}
+
+let controlServer = null;
+
+function getArgValue(name) {
+    const argv = process.argv || [];
+    const idx = argv.indexOf(name);
+    if (idx > -1) {
+        const value = argv[idx + 1];
+        if (value && typeof value === 'string' && !value.startsWith('--')) return value;
+    }
+    const prefix = name + '=';
+    const kv = argv.find(a => typeof a === 'string' && a.startsWith(prefix));
+    if (kv) return kv.slice(prefix.length);
+    return null;
+}
+
+function getControlConfig() {
+    const host = getArgValue('--control-host') || process.env.GEEKEZ_CONTROL_HOST || '127.0.0.1';
+    const portRaw = getArgValue('--control-port') || process.env.GEEKEZ_CONTROL_PORT || '';
+    const tokenRaw = getArgValue('--control-token') || process.env.GEEKEZ_CONTROL_TOKEN || '';
+    const port = portRaw ? Number(portRaw) : null;
+    const token = tokenRaw ? String(tokenRaw) : null;
+    return { host, port: Number.isFinite(port) ? port : null, token };
+}
+
+function sendJson(res, statusCode, payload) {
+    const body = JSON.stringify(payload);
+    res.statusCode = statusCode;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Content-Length', Buffer.byteLength(body));
+    res.end(body);
+}
+
+function readBody(req) {
+    return new Promise((resolve, reject) => {
+        let data = '';
+        req.on('data', chunk => {
+            data += chunk.toString('utf8');
+        });
+        req.on('end', () => resolve(data));
+        req.on('error', reject);
+    });
+}
+
+async function readJsonBody(req) {
+    const text = await readBody(req);
+    if (!text) return {};
+    try {
+        return JSON.parse(text);
+    } catch (e) {
+        throw new Error('Invalid JSON');
+    }
+}
+
+async function startControlServer() {
+    if (controlServer) return;
+    const cfg = getControlConfig();
+    if (!cfg.port) return;
+
+    controlServer = http.createServer(async (req, res) => {
+        try {
+            const url = new URL(req.url || '/', `http://${cfg.host}:${cfg.port}`);
+            if (cfg.token) {
+                const auth = String(req.headers.authorization || '');
+                if (auth !== `Bearer ${cfg.token}`) {
+                    return sendJson(res, 401, { ok: false, error: 'Unauthorized' });
+                }
+            }
+
+            if (req.method === 'GET' && url.pathname === '/health') {
+                return sendJson(res, 200, { ok: true });
+            }
+
+            if (req.method === 'GET' && url.pathname === '/profiles') {
+                const profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
+                const items = (profiles || []).map(p => ({
+                    id: p.id,
+                    name: p.name,
+                    debugPort: p.debugPort || null,
+                    tags: p.tags || []
+                }));
+                return sendJson(res, 200, { ok: true, profiles: items });
+            }
+
+            const launchMatch = url.pathname.match(/^\/profiles\/([0-9a-fA-F-]{36})\/launch$/);
+            if (req.method === 'POST' && launchMatch) {
+                const profileId = launchMatch[1];
+                const body = await readJsonBody(req);
+
+                let profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
+                const idx = (profiles || []).findIndex(p => p.id === profileId);
+                if (idx === -1) return sendJson(res, 404, { ok: false, error: 'Profile not found' });
+
+                const profile = profiles[idx];
+                const requestedDebugPort = body && Object.prototype.hasOwnProperty.call(body, 'debugPort') ? body.debugPort : undefined;
+                const requestedEnableRemoteDebugging = body && Object.prototype.hasOwnProperty.call(body, 'enableRemoteDebugging') ? body.enableRemoteDebugging : undefined;
+
+                let mutatedProfiles = false;
+                if (requestedDebugPort === 0 || requestedDebugPort === 'auto') {
+                    profile.debugPort = await getPort();
+                    mutatedProfiles = true;
+                } else if (typeof requestedDebugPort === 'number' && Number.isFinite(requestedDebugPort)) {
+                    profile.debugPort = requestedDebugPort;
+                    mutatedProfiles = true;
+                }
+
+                if (mutatedProfiles) {
+                    profiles[idx] = profile;
+                    await fs.writeJson(PROFILES_FILE, profiles);
+                }
+
+                if (requestedEnableRemoteDebugging !== undefined || profile.debugPort) {
+                    const settings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : {};
+                    if (requestedEnableRemoteDebugging !== undefined) settings.enableRemoteDebugging = !!requestedEnableRemoteDebugging;
+                    else settings.enableRemoteDebugging = true;
+                    await fs.writeJson(SETTINGS_FILE, settings);
+                }
+
+                const message = await launchProfileCore(null, profileId, body ? body.watermarkStyle : undefined);
+                const proc = activeProcesses[profileId];
+                const wsEndpoint = proc && proc.browser && typeof proc.browser.wsEndpoint === 'function' ? proc.browser.wsEndpoint() : null;
+                return sendJson(res, 200, {
+                    ok: true,
+                    profileId,
+                    message: message || null,
+                    debugPort: profile.debugPort || null,
+                    wsEndpoint
+                });
+            }
+
+            const stopMatch = url.pathname.match(/^\/profiles\/([0-9a-fA-F-]{36})\/stop$/);
+            if (req.method === 'POST' && stopMatch) {
+                const profileId = stopMatch[1];
+                const proc = activeProcesses[profileId];
+                if (!proc) {
+                    return sendJson(res, 200, { ok: true, profileId, message: 'Not running' });
+                }
+                try {
+                    if (proc.browser && typeof proc.browser.close === 'function') {
+                        await proc.browser.close();
+                    }
+                    delete activeProcesses[profileId];
+                    return sendJson(res, 200, { ok: true, profileId, message: 'Stopped' });
+                } catch (err) {
+                    return sendJson(res, 500, { ok: false, error: err.message || 'Failed to stop' });
+                }
+            }
+
+            return sendJson(res, 404, { ok: false, error: 'Not found' });
+        } catch (err) {
+            return sendJson(res, 500, { ok: false, error: err && err.message ? err.message : 'Internal error' });
+        }
+    });
+
+    controlServer.on('error', (err) => {
+        console.error('[Control] Server error:', err && err.message ? err.message : err);
+    });
+
+    controlServer.listen(cfg.port, cfg.host, () => {
+        console.log(`[Control] Listening on http://${cfg.host}:${cfg.port}`);
+    });
+}
+
+// ============================================================================
+// IP Geolocation Detection (通过代理检测 IP 位置信息)
+// ============================================================================
+const COUNTRY_LANGUAGE_MAP = {
+    'CN': 'zh-CN', 'TW': 'zh-TW', 'HK': 'zh-HK', 'JP': 'ja', 'KR': 'ko',
+    'US': 'en-US', 'GB': 'en-GB', 'AU': 'en-AU', 'CA': 'en-CA',
+    'DE': 'de', 'FR': 'fr', 'ES': 'es', 'IT': 'it', 'PT': 'pt',
+    'RU': 'ru', 'BR': 'pt-BR', 'MX': 'es-MX', 'AR': 'es-AR',
+    'IN': 'hi', 'TH': 'th', 'VN': 'vi', 'ID': 'id', 'MY': 'ms',
+    'PH': 'en-PH', 'SG': 'en-SG', 'NL': 'nl', 'PL': 'pl', 'TR': 'tr',
+    'SA': 'ar', 'AE': 'ar', 'IL': 'he', 'SE': 'sv', 'NO': 'nb', 'DK': 'da', 'FI': 'fi'
+};
+
+async function detectIpInfo(proxyStr) {
+    if (!proxyStr) return null;
+    
+    const tempPort = await getPort();
+    const tempConfigPath = path.join(app.getPath('userData'), `ip_detect_${tempPort}.json`);
+    
+    try {
+        const { parseProxyLink } = require('./utils');
+        let outbound;
+        try {
+            outbound = parseProxyLink(proxyStr, "ip_detect");
+        } catch (err) {
+            console.log('[IP Detect] Failed to parse proxy:', err.message);
+            return null;
+        }
+        
+        const config = {
+            log: { loglevel: "none" },
+            inbounds: [{ port: tempPort, listen: "127.0.0.1", protocol: "socks", settings: { udp: true } }],
+            outbounds: [outbound, { protocol: "freedom", tag: "direct" }],
+            routing: { rules: [{ type: "field", outboundTag: "ip_detect", port: "0-65535" }] }
+        };
+        
+        await fs.writeJson(tempConfigPath, config);
+        
+        // 启动 xray
+        const xrayBinPath = fs.existsSync(BIN_PATH) ? BIN_PATH : BIN_PATH_LEGACY;
+        const xrayBinDir = fs.existsSync(BIN_PATH) ? BIN_DIR : BIN_DIR_LEGACY;
+        const xrayProcess = spawn(xrayBinPath, ['-c', tempConfigPath], {
+            cwd: xrayBinDir,
+            env: { ...process.env, 'XRAY_LOCATION_ASSET': RESOURCES_BIN },
+            stdio: 'ignore',
+            windowsHide: true
+        });
+        
+        await new Promise(r => setTimeout(r, 800));
+        
+        const agent = new SocksProxyAgent(`socks5://127.0.0.1:${tempPort}`);
+        
+        const result = await new Promise((resolve) => {
+            const req = http.get('http://ip-api.com/json/?fields=status,country,countryCode,city,lat,lon,timezone', {
+                agent,
+                timeout: 8000
+            }, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                    try {
+                        const json = JSON.parse(data);
+                        if (json.status === 'success') {
+                            resolve({
+                                country: json.country,
+                                countryCode: json.countryCode,
+                                city: json.city,
+                                lat: json.lat,
+                                lon: json.lon,
+                                timezone: json.timezone,
+                                language: COUNTRY_LANGUAGE_MAP[json.countryCode] || 'en-US'
+                            });
+                        } else {
+                            resolve(null);
+                        }
+                    } catch (e) {
+                        resolve(null);
+                    }
+                });
+            });
+            req.on('error', () => resolve(null));
+            req.on('timeout', () => { req.destroy(); resolve(null); });
+        });
+        
+        await forceKill(xrayProcess.pid);
+        try { fs.unlinkSync(tempConfigPath); } catch (e) { }
+        
+        if (result) {
+            console.log(`[IP Detect] Success: ${result.city}, ${result.country} (${result.timezone})`);
+        }
+        return result;
+        
+    } catch (err) {
+        console.error('[IP Detect] Error:', err.message);
+        try { fs.unlinkSync(tempConfigPath); } catch (e) { }
+        return null;
+    }
 }
 
 // Settings management
@@ -495,7 +772,6 @@ async function autoStartApiServerFromSettings() {
     // API Server is normally started via renderer setting toggle. Automation expects
     // it to be available whenever enableApiServer=true.
     if (apiServerRunning) return;
-
     try {
         const settings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : {};
         if (!settings.enableApiServer) return;
@@ -507,7 +783,7 @@ async function autoStartApiServerFromSettings() {
             apiServer.on('error', reject);
         });
         apiServerRunning = true;
-        console.log(`\ud83d\udd0c API Server auto-started on http://localhost:${port}`);
+        console.log(`[API] Server auto-started on http://localhost:${port}`);
     } catch (err) {
         try {
             console.warn('Failed to auto-start API Server:', err && err.message ? err.message : err);
@@ -534,6 +810,7 @@ async function generateExtension(profilePath, fingerprint, profileName, watermar
 
 app.whenReady().then(async () => {
     createWindow();
+    await startControlServer();
     await autoStartApiServerFromSettings();
     setTimeout(() => { fs.emptyDir(TRASH_PATH).catch(() => { }); }, 10000);
 });
@@ -651,16 +928,31 @@ ipcMain.handle('save-profile', async (event, data) => {
     const profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
     const fingerprint = data.fingerprint || generateFingerprint();
 
-    // Apply timezone
-    if (data.timezone) fingerprint.timezone = data.timezone;
-    else fingerprint.timezone = "America/Los_Angeles";
-
-    // Apply city and geolocation
-    if (data.city) fingerprint.city = data.city;
-    if (data.geolocation) fingerprint.geolocation = data.geolocation;
-
-    // Apply language
-    if (data.language && data.language !== 'auto') fingerprint.language = data.language;
+    // 自动检测 IP 位置信息（如果用户未手动设置 timezone/city/language）
+    const needsAutoDetect = data.proxyStr && 
+        (!data.timezone || data.timezone === 'Auto') && 
+        (!data.city || data.city === 'Auto') && 
+        (!data.language || data.language === 'auto');
+    
+    if (needsAutoDetect) {
+        const ipInfo = await detectIpInfo(data.proxyStr);
+        if (ipInfo) {
+            fingerprint.timezone = ipInfo.timezone;
+            fingerprint.city = ipInfo.city;
+            fingerprint.language = ipInfo.language;
+            fingerprint.geolocation = { latitude: ipInfo.lat, longitude: ipInfo.lon, accuracy: 100 };
+            console.log(`[Auto Fingerprint] ${ipInfo.city}, ${ipInfo.country} | TZ: ${ipInfo.timezone} | Lang: ${ipInfo.language}`);
+        } else {
+            fingerprint.timezone = "America/Los_Angeles";
+            fingerprint.language = "en-US";
+        }
+    } else {
+        if (data.timezone && data.timezone !== 'Auto') fingerprint.timezone = data.timezone;
+        else fingerprint.timezone = "America/Los_Angeles";
+        if (data.city) fingerprint.city = data.city;
+        if (data.geolocation) fingerprint.geolocation = data.geolocation;
+        if (data.language && data.language !== 'auto') fingerprint.language = data.language;
+    }
 
     const newProfile = {
         id: uuidv4(),
@@ -1261,9 +1553,7 @@ ipcMain.handle('export-data', async (e, type) => {
     return false;
 });
 
-// --- 核心启动逻辑 ---
-ipcMain.handle('launch-profile', async (event, profileId, watermarkStyle) => {
-    const sender = event.sender;
+async function launchProfileCore(sender, profileId, watermarkStyle) {
 
     if (activeProcesses[profileId]) {
         const proc = activeProcesses[profileId];
@@ -1387,6 +1677,7 @@ ipcMain.handle('launch-profile', async (event, profileId, watermarkStyle) => {
             `--proxy-server=socks5://127.0.0.1:${localPort}`,
             `--user-data-dir=${userDataDir}`,
             `--window-size=${profile.fingerprint?.window?.width || 1280},${profile.fingerprint?.window?.height || 800}`,
+            `--class=GeekezBrowser-${profile.id.slice(0, 8)}`,
             '--restore-last-session',
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -1436,7 +1727,7 @@ ipcMain.handle('launch-profile', async (event, profileId, watermarkStyle) => {
         const chromePath = getChromiumPath();
         if (!chromePath) {
             await forceKill(xrayProcess.pid);
-            throw new Error("Chrome binary not found.");
+            throw new Error(`Chrome binary not found (platform: ${process.platform}). Set PUPPETEER_EXECUTABLE_PATH or put Chrome under resources/puppeteer.`);
         }
 
         // 时区设置
@@ -1462,7 +1753,7 @@ ipcMain.handle('launch-profile', async (event, profileId, watermarkStyle) => {
             browser,
             logFd: logFd  // 存储日志文件描述符，用于后续关闭
         };
-        sender.send('profile-status', { id: profileId, status: 'running' });
+        if (sender && !sender.isDestroyed()) sender.send('profile-status', { id: profileId, status: 'running' });
 
         // CDP Geolocation Removed in favor of Stealth JS Hook
         // 由于 CDP 本身会被检测，我们移除所有 Emulation.Overrides
@@ -1493,7 +1784,7 @@ ipcMain.handle('launch-profile', async (event, profileId, watermarkStyle) => {
                     // 忽略清理错误
                 }
 
-                if (!sender.isDestroyed()) sender.send('profile-status', { id: profileId, status: 'stopped' });
+                if (sender && !sender.isDestroyed()) sender.send('profile-status', { id: profileId, status: 'stopped' });
             }
         });
 
@@ -1502,11 +1793,24 @@ ipcMain.handle('launch-profile', async (event, profileId, watermarkStyle) => {
         console.error(err);
         throw err;
     }
+}
+
+ipcMain.handle('launch-profile', async (event, profileId, watermarkStyle) => {
+    return launchProfileCore(event.sender, profileId, watermarkStyle);
 });
 
 app.on('window-all-closed', () => {
     Object.values(activeProcesses).forEach(p => forceKill(p.xrayPid));
     if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('before-quit', () => {
+    if (controlServer) {
+        try {
+            controlServer.close();
+        } catch (e) { }
+        controlServer = null;
+    }
 });
 // Helpers (Same)
 function fetchJson(url) { return new Promise((resolve, reject) => { const req = https.get(url, { headers: { 'User-Agent': 'GeekEZ-Browser' } }, (res) => { let data = ''; res.on('data', c => data += c); res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } }); }); req.on('error', reject); }); }
