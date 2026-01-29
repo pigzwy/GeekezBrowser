@@ -213,9 +213,34 @@ async function handleApiRequest(method, pathname, body, params) {
         if (!profile) return { status: 404, data: { success: false, error: 'Profile not found' } };
         const proc = activeProcesses[profile.id];
         if (!proc) return { status: 404, data: { success: false, error: 'Profile not running' } };
+
+        // Align with in-app cleanup behavior (see: ipcMain.handle('delete-profile'))
+        // activeProcesses stores { xrayPid, browser, logFd }, not necessarily a chromePid.
         await forceKill(proc.xrayPid);
-        await forceKill(proc.chromePid);
+
+        // Prefer Puppeteer browser.close() to shut down the window gracefully.
+        try {
+            if (proc.browser && typeof proc.browser.close === 'function') {
+                await proc.browser.close();
+            } else if (proc.chromePid) {
+                // Backward-compat fallback if some builds still track chromePid
+                await forceKill(proc.chromePid);
+            }
+        } catch (e) {
+            try {
+                console.warn('Failed to close browser for profile:', profile.id, e && e.message ? e.message : e);
+            } catch (_) { }
+        }
+
+        // Close log file descriptor (Windows needs this)
+        if (proc.logFd !== undefined) {
+            try {
+                fs.closeSync(proc.logFd);
+            } catch (e) { }
+        }
+
         delete activeProcesses[profile.id];
+        await new Promise(r => setTimeout(r, 200));
         return { success: true, message: 'Profile stopped' };
     }
 
@@ -466,6 +491,30 @@ function notifyUIRefresh() {
     }
 }
 
+async function autoStartApiServerFromSettings() {
+    // API Server is normally started via renderer setting toggle. Automation expects
+    // it to be available whenever enableApiServer=true.
+    if (apiServerRunning) return;
+
+    try {
+        const settings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : {};
+        if (!settings.enableApiServer) return;
+
+        const port = settings.apiPort || 12138;
+        apiServer = createApiServer(port);
+        await new Promise((resolve, reject) => {
+            apiServer.listen(port, '127.0.0.1', () => resolve());
+            apiServer.on('error', reject);
+        });
+        apiServerRunning = true;
+        console.log(`\ud83d\udd0c API Server auto-started on http://localhost:${port}`);
+    } catch (err) {
+        try {
+            console.warn('Failed to auto-start API Server:', err && err.message ? err.message : err);
+        } catch (_) { }
+    }
+}
+
 async function generateExtension(profilePath, fingerprint, profileName, watermarkStyle) {
     const extDir = path.join(profilePath, 'extension');
     await fs.ensureDir(extDir);
@@ -485,6 +534,7 @@ async function generateExtension(profilePath, fingerprint, profileName, watermar
 
 app.whenReady().then(async () => {
     createWindow();
+    await autoStartApiServerFromSettings();
     setTimeout(() => { fs.emptyDir(TRASH_PATH).catch(() => { }); }, 10000);
 });
 
