@@ -1661,6 +1661,7 @@ async function launchProfileCore(sender, profileId, watermarkStyle) {
         // 1. 生成 GeekEZ Guard 扩展（使用传递的水印样式）
         const style = watermarkStyle || 'enhanced'; // 默认使用增强水印
         const extPath = await generateExtension(profileDir, profile.fingerprint, profile.name, style);
+        const injectScript = getInjectScript(profile.fingerprint, profile.name, style);
 
         // 2. 获取用户自定义扩展
         const userExts = settings.userExtensions || [];
@@ -1669,6 +1670,16 @@ async function launchProfileCore(sender, profileId, watermarkStyle) {
         let extPaths = extPath; // GeekEZ Guard
         if (userExts.length > 0) {
             extPaths += ',' + userExts.join(',');
+        }
+        try {
+            const manifestPath = path.join(extPath, 'manifest.json');
+            if (!fs.existsSync(manifestPath)) {
+                console.warn('[Extension] manifest missing:', manifestPath);
+            } else {
+                console.log('[Extension] Loaded:', extPaths);
+            }
+        } catch (e) {
+            console.warn('[Extension] check failed:', e && e.message ? e.message : e);
         }
 
         // 4. 构建启动参数（性能优化）
@@ -1742,10 +1753,38 @@ async function launchProfileCore(sender, profileId, watermarkStyle) {
             userDataDir: userDataDir,
             args: launchArgs,
             defaultViewport: null,
-            ignoreDefaultArgs: ['--enable-automation'],
+            ignoreDefaultArgs: ['--enable-automation', '--disable-extensions'],
             pipe: false,
             dumpio: false,
             env: env  // 注入环境变量
+        });
+
+        const addInitScript = async (page) => {
+            try {
+                if (page && typeof page.setBypassCSP === 'function') {
+                    await page.setBypassCSP(true);
+                }
+                await page.evaluateOnNewDocument(injectScript);
+            } catch (e) {
+                console.warn('[Inject] evaluateOnNewDocument failed:', e && e.message ? e.message : e);
+            }
+        };
+
+        try {
+            const pages = await browser.pages();
+            await Promise.all(pages.map(addInitScript));
+        } catch (e) {
+            console.warn('[Inject] init pages failed:', e && e.message ? e.message : e);
+        }
+
+        browser.on('targetcreated', async (target) => {
+            if (target.type() !== 'page') return;
+            try {
+                const page = await target.page();
+                if (page) await addInitScript(page);
+            } catch (e) {
+                console.warn('[Inject] targetcreated failed:', e && e.message ? e.message : e);
+            }
         });
 
         activeProcesses[profileId] = {
