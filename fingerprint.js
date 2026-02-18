@@ -53,8 +53,10 @@ function getInjectScript(fp, profileName, watermarkStyle) {
     const style = watermarkStyle || 'enhanced'; // 默认使用增强水印
     return `
     (function() {
-        if (window.__geekezInjected) return;
-        window.__geekezInjected = true;
+        // 使用 Symbol 作为注入标记，避免在 window 上暴露可检测的命名属性
+        const _injKey = Symbol.for('__fp_guard__');
+        if (window[_injKey]) return;
+        Object.defineProperty(window, _injKey, { value: true, enumerable: false, configurable: false });
         try {
             const fp = ${fpJson};
             const targetTimezone = fp.timezone || "America/Los_Angeles";
@@ -161,26 +163,118 @@ function getInjectScript(fp, profileName, watermarkStyle) {
             }
 
             // --- 1. 移除 WebDriver 及 Puppeteer 特征 ---
-            if (navigator.webdriver) {
-                Object.defineProperty(navigator, 'webdriver', { get: () => false });
-            }
-            // 移除 cdc_ 变量 (Puppeteer 特征)
+            // 多层策略确保 navigator.webdriver = false:
+            // 主防线: --disable-blink-features=AutomationControlled (Chrome 启动参数)
+            // 后备: JavaScript 层面覆盖 (处理极端情况)
+            const applyWebdriverOverride = () => {
+                const wdGetter = function webdriver() { return false; };
+                Object.defineProperty(wdGetter, 'toString', {
+                    value: function() { return 'function get webdriver() { [native code] }'; },
+                    configurable: true, writable: true
+                });
+                Object.defineProperty(wdGetter.toString, 'toString', {
+                    value: function() { return 'function toString() { [native code] }'; },
+                    configurable: true, writable: true
+                });
+
+                // 策略 1: 先删除再在原型链上重新定义
+                try {
+                    delete Navigator.prototype.webdriver;
+                    Object.defineProperty(Navigator.prototype, 'webdriver', {
+                        get: wdGetter,
+                        set: function() {},
+                        configurable: true
+                    });
+                } catch(e) {}
+
+                // 策略 2: 在实例上也覆盖（处理 Chrome 在实例上设置 own property 的情况）
+                try {
+                    delete navigator.webdriver;
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: wdGetter,
+                        set: function() {},
+                        configurable: true
+                    });
+                } catch(e) {}
+            };
+
+            // 立即执行
+            applyWebdriverOverride();
+            // 延迟执行（处理 Chrome 在 document_start 之后才设置 webdriver 的情况）
+            Promise.resolve().then(applyWebdriverOverride);
+            setTimeout(applyWebdriverOverride, 0);
+
+            // 移除 cdc_ 变量 (Puppeteer/ChromeDriver 特征)
             const cdcRegex = /cdc_[a-zA-Z0-9]+/;
             for (const key in window) {
                 if (cdcRegex.test(key)) {
-                    delete window[key];
+                    try { delete window[key]; } catch(e) {}
                 }
             }
             // 防御性移除常见自动化变量
-            ['$cdc_asdjflasutopfhvcZLmcfl_', '$chrome_asyncScriptInfo', 'callPhantom', 'webdriver'].forEach(k => {
-                 if (window[k]) delete window[k];
+            ['$cdc_asdjflasutopfhvcZLmcfl_', '$chrome_asyncScriptInfo', 'callPhantom', 'webdriver',
+             '__webdriver_evaluate', '__selenium_evaluate', '__fxdriver_evaluate', '__driver_evaluate',
+             '__webdriver_unwrap', '__selenium_unwrap', '__fxdriver_unwrap', '__driver_unwrap',
+             '_Selenium_IDE_Recorder', '_selenium', 'calledSelenium', '_WEBDRIVER_ELEM_CACHE',
+             'ChromeDriverw', '__$webdriverAsyncExecutor'].forEach(k => {
+                 try { if (window[k]) delete window[k]; } catch(e) {}
             });
-            Object.defineProperty(window, 'chrome', {
-                writable: true,
-                enumerable: true,
-                configurable: false,
-                value: { app: { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }, RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' } }, runtime: { OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' }, OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' }, PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' }, PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', X86_32: 'x86-32', X86_64: 'x86-64' }, PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' }, RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' } } }
-            });
+
+            // 移除 document 上的自动化标记
+            try {
+                if (document.documentElement) {
+                    document.documentElement.removeAttribute('webdriver');
+                    document.documentElement.removeAttribute('selenium');
+                    document.documentElement.removeAttribute('driver');
+                }
+            } catch(e) {}
+
+            // 确保 window.chrome 对象存在且完整
+            // 注意：不要覆盖已有的 chrome 对象（扩展加载后 Chrome 会提供原生 chrome.runtime）
+            // 只在缺失时补充必要的属性
+            if (!window.chrome) {
+                window.chrome = {};
+            }
+            if (!window.chrome.app) {
+                window.chrome.app = {
+                    isInstalled: false,
+                    InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+                    RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' }
+                };
+            }
+            if (!window.chrome.runtime) {
+                window.chrome.runtime = {
+                    OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
+                    OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
+                    PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+                    PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', X86_32: 'x86-32', X86_64: 'x86-64' },
+                    PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
+                    RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' }
+                };
+            }
+            // 补充 chrome.csi 和 chrome.loadTimes（正常 Chrome 都有）
+            if (!window.chrome.csi) {
+                window.chrome.csi = function() { return { startE: Date.now(), onloadT: Date.now(), pageT: Date.now() - performance.timing.navigationStart, tran: 15 }; };
+            }
+            if (!window.chrome.loadTimes) {
+                window.chrome.loadTimes = function() {
+                    return {
+                        commitLoadTime: performance.timing.responseStart / 1000,
+                        connectionInfo: 'h2',
+                        finishDocumentLoadTime: performance.timing.domContentLoadedEventEnd / 1000,
+                        finishLoadTime: performance.timing.loadEventEnd / 1000,
+                        firstPaintAfterLoadTime: 0,
+                        firstPaintTime: performance.timing.domContentLoadedEventEnd / 1000,
+                        navigationType: 'Other',
+                        npnNegotiatedProtocol: 'h2',
+                        requestTime: performance.timing.navigationStart / 1000,
+                        startLoadTime: performance.timing.navigationStart / 1000,
+                        wasAlternateProtocolAvailable: false,
+                        wasFetchedViaSpdy: true,
+                        wasNpnNegotiated: true
+                    };
+                };
+            }
 
             // --- 1.5 Screen Resolution Hook ---
             // Override screen properties to match fingerprint values
