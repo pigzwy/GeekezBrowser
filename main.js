@@ -1775,11 +1775,7 @@ async function launchProfileCore(sender, profileId, watermarkStyle) {
             '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',  // 防止 WebRTC 泄漏真实 IP
 
             // === 反自动化检测（关键）===
-            // Puppeteer 的 pipe 模式会添加 --remote-debugging-pipe，Chrome 检测到后
-            // 在 C++ 层面强制设置 navigator.webdriver = true（绕过 JS 覆盖）。
-            // 此参数在 Chrome 启动时禁用 AutomationControlled 特性，使 webdriver 保持 false。
-            // 注：网页 JavaScript 无法读取 Chrome 命令行参数，此参数不会被 Stripe/CF 检测到。
-            '--disable-blink-features=AutomationControlled',
+            // webdriver 覆盖由注入脚本处理，避免使用不兼容的命令行参数。
 
             // === 语言 ===
             `--lang=${targetLang}`,

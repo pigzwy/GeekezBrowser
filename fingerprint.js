@@ -57,6 +57,18 @@ function getInjectScript(fp, profileName, watermarkStyle) {
         const _injKey = Symbol.for('__fp_guard__');
         if (window[_injKey]) return;
         Object.defineProperty(window, _injKey, { value: true, enumerable: false, configurable: false });
+
+        const host = (location && location.hostname ? location.hostname : '').toLowerCase();
+        const paymentDomains = [
+            'stripe.com',
+            'paypal.com',
+            'braintreegateway.com',
+            'braintree-api.com',
+            'adyen.com',
+            'cardinalcommerce.com'
+        ];
+        if (paymentDomains.some(domain => host === domain || host.endsWith('.' + domain))) return;
+
         try {
             const fp = ${fpJson};
             const targetTimezone = fp.timezone || "America/Los_Angeles";
@@ -164,8 +176,7 @@ function getInjectScript(fp, profileName, watermarkStyle) {
 
             // --- 1. 移除 WebDriver 及 Puppeteer 特征 ---
             // 多层策略确保 navigator.webdriver = false:
-            // 主防线: --disable-blink-features=AutomationControlled (Chrome 启动参数)
-            // 后备: JavaScript 层面覆盖 (处理极端情况)
+            // 以 JavaScript 层面覆盖为主 (处理极端情况)
             const applyWebdriverOverride = () => {
                 const wdGetter = function webdriver() { return false; };
                 Object.defineProperty(wdGetter, 'toString', {
