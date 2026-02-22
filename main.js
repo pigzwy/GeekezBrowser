@@ -215,14 +215,15 @@ async function handleApiRequest(method, pathname, body, params) {
         if (!proc) return { status: 404, data: { success: false, error: 'Profile not running' } };
 
         // Align with in-app cleanup behavior (see: ipcMain.handle('delete-profile'))
-        // Puppeteer 已断开，使用进程管理关闭浏览器
+        // activeProcesses stores { xrayPid, browser, logFd }, not necessarily a chromePid.
         await forceKill(proc.xrayPid);
 
-        // 关闭 Chrome 进程
+        // Prefer Puppeteer browser.close() to shut down the window gracefully.
         try {
-            if (proc.chromeProcess && !proc.chromeProcess.killed) {
-                proc.chromeProcess.kill();
+            if (proc.browser && typeof proc.browser.close === 'function') {
+                await proc.browser.close();
             } else if (proc.chromePid) {
+                // Backward-compat fallback if some builds still track chromePid
                 await forceKill(proc.chromePid);
             }
         } catch (e) {
@@ -423,19 +424,10 @@ function forceKill(pid) {
 }
 
 function getChromiumPath() {
-    // 优先级 1：环境变量指定的路径
+    const basePath = isDev ? path.join(__dirname, 'resources', 'puppeteer') : path.join(process.resourcesPath, 'puppeteer');
+
     const envPath = process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROME_PATH;
     if (envPath && fs.existsSync(envPath)) return envPath;
-
-    // 优先级 2：系统安装的正版 Chrome（推荐！避免 Chrome for Testing 被检测）
-    const systemChrome = findSystemChrome();
-    if (systemChrome) {
-        console.log('[Chrome] Using system Chrome:', systemChrome);
-        return systemChrome;
-    }
-
-    // 优先级 3：Puppeteer 自带的 Chrome for Testing（降级方案）
-    const basePath = isDev ? path.join(__dirname, 'resources', 'puppeteer') : path.join(process.resourcesPath, 'puppeteer');
 
     if (!fs.existsSync(basePath)) return null;
     function findFile(dir, filename) {
@@ -468,45 +460,6 @@ function getChromiumPath() {
     }
 
     return findFile(basePath, 'chrome');
-}
-
-/**
- * 查找系统安装的正版 Chrome
- * 正版 Chrome 不会被 Stripe/Cloudflare 标记为 "Chrome for Testing"
- */
-function findSystemChrome() {
-    if (process.platform === 'win32') {
-        // Windows: 检查常见安装路径
-        const candidates = [
-            path.join(process.env.PROGRAMFILES || 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
-            path.join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'Google', 'Chrome', 'Application', 'chrome.exe'),
-            path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
-        ];
-        for (const p of candidates) {
-            if (p && fs.existsSync(p)) return p;
-        }
-    } else if (process.platform === 'darwin') {
-        // macOS: 检查 Applications
-        const candidates = [
-            '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-            path.join(os.homedir(), 'Applications', 'Google Chrome.app', 'Contents', 'MacOS', 'Google Chrome'),
-        ];
-        for (const p of candidates) {
-            if (fs.existsSync(p)) return p;
-        }
-    } else {
-        // Linux
-        const candidates = [
-            '/usr/bin/google-chrome',
-            '/usr/bin/google-chrome-stable',
-            '/usr/bin/chromium-browser',
-            '/usr/bin/chromium',
-        ];
-        for (const p of candidates) {
-            if (fs.existsSync(p)) return p;
-        }
-    }
-    return null;
 }
 
 let controlServer = null;
@@ -604,7 +557,6 @@ async function startControlServer() {
                 const profile = profiles[idx];
                 const requestedDebugPort = body && Object.prototype.hasOwnProperty.call(body, 'debugPort') ? body.debugPort : undefined;
                 const requestedEnableRemoteDebugging = body && Object.prototype.hasOwnProperty.call(body, 'enableRemoteDebugging') ? body.enableRemoteDebugging : undefined;
-                const requestedRemoteDebuggingAddress = body && body.remoteDebuggingAddress ? body.remoteDebuggingAddress : undefined;
 
                 let mutatedProfiles = false;
                 if (requestedDebugPort === 0 || requestedDebugPort === 'auto') {
@@ -612,12 +564,6 @@ async function startControlServer() {
                     mutatedProfiles = true;
                 } else if (typeof requestedDebugPort === 'number' && Number.isFinite(requestedDebugPort)) {
                     profile.debugPort = requestedDebugPort;
-                    mutatedProfiles = true;
-                }
-
-                // 保存远程调试绑定地址到 profile（供启动时读取）
-                if (requestedRemoteDebuggingAddress) {
-                    profile.remoteDebuggingAddress = requestedRemoteDebuggingAddress;
                     mutatedProfiles = true;
                 }
 
@@ -635,7 +581,7 @@ async function startControlServer() {
 
                 const message = await launchProfileCore(null, profileId, body ? body.watermarkStyle : undefined);
                 const proc = activeProcesses[profileId];
-                const wsEndpoint = proc ? proc.wsEndpoint || null : null;
+                const wsEndpoint = proc && proc.browser && typeof proc.browser.wsEndpoint === 'function' ? proc.browser.wsEndpoint() : null;
                 return sendJson(res, 200, {
                     ok: true,
                     profileId,
@@ -653,17 +599,8 @@ async function startControlServer() {
                     return sendJson(res, 200, { ok: true, profileId, message: 'Not running' });
                 }
                 try {
-                    // Puppeteer 已断开，使用进程管理关闭浏览器
-                    if (proc.chromeProcess && !proc.chromeProcess.killed) {
-                        proc.chromeProcess.kill();
-                    } else if (proc.chromePid) {
-                        await forceKill(proc.chromePid);
-                    }
-                    // 清理 xray 进程
-                    await forceKill(proc.xrayPid);
-                    // 关闭日志文件描述符
-                    if (proc.logFd !== undefined) {
-                        try { fs.closeSync(proc.logFd); } catch (e) { }
+                    if (proc.browser && typeof proc.browser.close === 'function') {
+                        await proc.browser.close();
                     }
                     delete activeProcesses[profileId];
                     return sendJson(res, 200, { ok: true, profileId, message: 'Stopped' });
@@ -1035,13 +972,8 @@ ipcMain.handle('delete-profile', async (event, id) => {
     // 关闭正在运行的进程
     if (activeProcesses[id]) {
         await forceKill(activeProcesses[id].xrayPid);
-        // Puppeteer 已断开，使用进程管理关闭浏览器
         try {
-            if (activeProcesses[id].chromeProcess && !activeProcesses[id].chromeProcess.killed) {
-                activeProcesses[id].chromeProcess.kill();
-            } else if (activeProcesses[id].chromePid) {
-                await forceKill(activeProcesses[id].chromePid);
-            }
+            await activeProcesses[id].browser.close();
         } catch (e) { }
 
         // 关闭日志文件描述符（Windows 必须）
@@ -1625,30 +1557,32 @@ async function launchProfileCore(sender, profileId, watermarkStyle) {
 
     if (activeProcesses[profileId]) {
         const proc = activeProcesses[profileId];
-        // 检查 Chrome 进程是否仍然存活（Puppeteer 已断开，不能用 browser.isConnected()）
-        let isAlive = false;
-        if (proc.chromeProcess && !proc.chromeProcess.killed) {
+        if (proc.browser && proc.browser.isConnected()) {
             try {
-                // process.kill(pid, 0) 不发送信号，仅检查进程是否存在
-                process.kill(proc.chromeProcess.pid, 0);
-                isAlive = true;
+                const targets = await proc.browser.targets();
+                const pageTarget = targets.find(t => t.type() === 'page');
+                if (pageTarget) {
+                    const page = await pageTarget.page();
+                    if (page) {
+                        const session = await pageTarget.createCDPSession();
+                        const { windowId } = await session.send('Browser.getWindowForTarget');
+                        await session.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } });
+                        setTimeout(async () => {
+                            try { await session.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } }); } catch (e) { }
+                        }, 100);
+                        await page.bringToFront();
+                    }
+                }
+                return "环境已唤醒";
             } catch (e) {
-                isAlive = false;
+                await forceKill(proc.xrayPid);
+                delete activeProcesses[profileId];
             }
-        }
-
-        if (isAlive) {
-            // 浏览器仍在运行，提示用户手动切换窗口
-            // 注：由于 CDP 已断开，无法通过 CDP 命令聚焦窗口
-            return "环境已在运行中";
         } else {
-            // 进程已退出但未清理，做清理
             await forceKill(proc.xrayPid);
-            if (proc.logFd !== undefined) {
-                try { fs.closeSync(proc.logFd); } catch (e) { }
-            }
             delete activeProcesses[profileId];
         }
+        if (activeProcesses[profileId]) return "环境已唤醒";
     }
 
     await new Promise(resolve => setTimeout(resolve, 500));
@@ -1727,8 +1661,7 @@ async function launchProfileCore(sender, profileId, watermarkStyle) {
         // 1. 生成 GeekEZ Guard 扩展（使用传递的水印样式）
         const style = watermarkStyle || 'enhanced'; // 默认使用增强水印
         const extPath = await generateExtension(profileDir, profile.fingerprint, profile.name, style);
-        // 注：getInjectScript 不再需要单独调用，扩展已包含完整注入脚本
-        // 原来的 injectScript 变量用于 CDP evaluateOnNewDocument，现已移除
+        const injectScript = getInjectScript(profile.fingerprint, profile.name, style);
 
         // 2. 获取用户自定义扩展
         const userExts = settings.userExtensions || [];
@@ -1749,65 +1682,41 @@ async function launchProfileCore(sender, profileId, watermarkStyle) {
             console.warn('[Extension] check failed:', e && e.message ? e.message : e);
         }
 
-        // 4. 构建启动参数
-        // ====================================================================
-        // 原则：尽可能模拟真实用户的 Chrome 启动方式
-        // 移除所有会被 Stripe/Cloudflare 检测为自动化的参数
-        //
-        // 已移除的自动化指标:
-        //   --no-sandbox              → Windows 不需要，是 CI/Docker 才用的
-        //   --disable-infobars        → 经典自动化标志，Stripe 重点检测
-        //   --disable-dev-shm-usage   → Docker/CI 专用
-        //   --disable-features=IsolateOrigins,site-per-process → 安全降级
-        //   --disable-background-timer-throttling → 正常浏览器不会加
-        //   --disable-backgrounding-occluded-windows → 同上
-        //   --disable-renderer-backgrounding → 同上
-        //   --disk-cache-size / --media-cache-size → 非标准配置
-        //   --class=GeekezBrowser-xxx → 直接暴露身份
-        // ====================================================================
+        // 4. 构建启动参数（性能优化）
 
         const launchArgs = [
-            // === 核心功能（必需）===
             `--proxy-server=socks5://127.0.0.1:${localPort}`,
             `--user-data-dir=${userDataDir}`,
             `--window-size=${profile.fingerprint?.window?.width || 1280},${profile.fingerprint?.window?.height || 800}`,
+            `--class=GeekezBrowser-${profile.id.slice(0, 8)}`,
             '--restore-last-session',
-            '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',  // 防止 WebRTC 泄漏真实 IP
-
-            // === 反自动化检测（关键）===
-            // webdriver 覆盖由注入脚本处理，避免使用不兼容的命令行参数。
-
-            // === 语言 ===
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-blink-features=AutomationControlled',
+            '--disable-features=IsolateOrigins,site-per-process',
+            '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
             `--lang=${targetLang}`,
             `--accept-lang=${targetLang}`,
-
-            // === 扩展加载 ===
             `--disable-extensions-except=${extPaths}`,
             `--load-extension=${extPaths}`,
-
-            // === 普通用户也会有的参数 ===
-            '--no-first-run',
-            '--no-default-browser-check',
+            // 性能优化参数
+            '--no-first-run',                    // 跳过首次运行向导
+            '--no-default-browser-check',        // 跳过默认浏览器检查
+            '--disable-background-timer-throttling', // 防止后台标签页被限速
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
+            '--disable-dev-shm-usage',           // 减少共享内存使用
+            '--disk-cache-size=52428800',        // 限制磁盘缓存为 50MB
+            '--media-cache-size=52428800'        // 限制媒体缓存为 50MB
         ];
-
-        // Linux 专用沙箱参数（Windows/macOS 不需要）
-        if (process.platform === 'linux') {
-            launchArgs.push('--no-sandbox');
-            launchArgs.push('--disable-setuid-sandbox');
-        }
 
         // 5. Remote Debugging Port (if enabled)
         if (settings.enableRemoteDebugging && profile.debugPort) {
             launchArgs.push(`--remote-debugging-port=${profile.debugPort}`);
-            // 支持远程调试地址绑定（默认 127.0.0.1，设为 0.0.0.0 可让 Docker 容器访问）
-            const debugAddr = profile.remoteDebuggingAddress || '127.0.0.1';
-            if (debugAddr !== '127.0.0.1') {
-                launchArgs.push(`--remote-debugging-address=${debugAddr}`);
-            }
             console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
             console.log('⚠️  REMOTE DEBUGGING ENABLED');
-            console.log(`📡 Port: ${profile.debugPort}, Address: ${debugAddr}`);
-            console.log(`🔗 Connect: chrome://inspect or ws://${debugAddr}:${profile.debugPort}`);
+            console.log(`📡 Port: ${profile.debugPort}`);
+            console.log(`🔗 Connect: chrome://inspect or ws://localhost:${profile.debugPort}`);
             console.log('⚠️  WARNING: May increase automation detection risk!');
             console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         }
@@ -1844,60 +1753,65 @@ async function launchProfileCore(sender, profileId, watermarkStyle) {
             userDataDir: userDataDir,
             args: launchArgs,
             defaultViewport: null,
-            // 忽略 Puppeteer 所有默认参数 —— 这些参数是自动化特征，
-            // 会被 Stripe/Cloudflare 等风控系统识别为非真实浏览器。
-            // 所有需要的参数已在 launchArgs 中显式指定。
-            ignoreDefaultArgs: true,
-            // 使用 pipe 模式而非 WebSocket：
-            // pipe=false → Puppeteer 添加 --remote-debugging-port=0 → 调试端口暴露
-            // pipe=true  → 通过 stdin/stdout 管道通信 → 不开放任何网络端口
-            pipe: true,
+            ignoreDefaultArgs: ['--enable-automation', '--disable-extensions'],
+            pipe: false,
             dumpio: false,
             env: env  // 注入环境变量
         });
 
-        // ====================================================================
-        // 不再通过 CDP 注入脚本！
-        // 原来的 evaluateOnNewDocument / setBypassCSP / targetcreated 监听
-        // 全部移除。指纹注入完全由 Chrome Extension (content_scripts,
-        // world: MAIN, all_frames: true, run_at: document_start) 负责。
-        //
-        // CDP 注入的问题：
-        //  1. Page.addScriptToEvaluateOnNewDocument 会留下可检测的绑定
-        //  2. Page.setBypassCSP 修改 CSP 状态，可被 Stripe/CF 检测
-        //  3. 活跃的 CDP 会话本身就是自动化痕迹
-        // ====================================================================
+        const addInitScript = async (page) => {
+            try {
+                if (page && typeof page.setBypassCSP === 'function') {
+                    await page.setBypassCSP(true);
+                }
+                await page.evaluateOnNewDocument(injectScript);
+            } catch (e) {
+                console.warn('[Inject] evaluateOnNewDocument failed:', e && e.message ? e.message : e);
+            }
+        };
 
-        // 获取 Chrome 进程句柄（在断开 Puppeteer 之前）
-        const chromeProcess = browser.process();
-        const chromePid = chromeProcess ? chromeProcess.pid : null;
-        // pipe 模式下 wsEndpoint 不可用，但外部自动化可通过 Remote Debugging Port 连接
-        let savedWsEndpoint = null;
-        try { savedWsEndpoint = browser.wsEndpoint(); } catch (e) { /* pipe mode: no ws */ }
+        try {
+            const pages = await browser.pages();
+            await Promise.all(pages.map(addInitScript));
+        } catch (e) {
+            console.warn('[Inject] init pages failed:', e && e.message ? e.message : e);
+        }
+
+        browser.on('targetcreated', async (target) => {
+            if (target.type() !== 'page') return;
+            try {
+                const page = await target.page();
+                if (page) await addInitScript(page);
+            } catch (e) {
+                console.warn('[Inject] targetcreated failed:', e && e.message ? e.message : e);
+            }
+        });
 
         activeProcesses[profileId] = {
             xrayPid: xrayProcess.pid,
-            chromeProcess: chromeProcess,
-            chromePid: chromePid,
-            wsEndpoint: savedWsEndpoint,
+            browser,
             logFd: logFd  // 存储日志文件描述符，用于后续关闭
         };
         if (sender && !sender.isDestroyed()) sender.send('profile-status', { id: profileId, status: 'running' });
 
-        // 监控 Chrome 进程退出 → 清理 xray + 日志资源
-        // 替代原来的 browser.on('disconnected')，因为我们会主动断开 Puppeteer
-        if (chromeProcess) {
-            chromeProcess.on('exit', async () => {
-                if (!activeProcesses[profileId]) return;
-                const proc = activeProcesses[profileId];
+        // CDP Geolocation Removed in favor of Stealth JS Hook
+        // 由于 CDP 本身会被检测，我们移除所有 Emulation.Overrides
+        // 地理位置将由 fingerprint.js 中的 Stealth Hook 接管
+
+        browser.on('disconnected', async () => {
+            if (activeProcesses[profileId]) {
+                const pid = activeProcesses[profileId].xrayPid;
+                const logFd = activeProcesses[profileId].logFd;
 
                 // 关闭日志文件描述符
-                if (proc.logFd !== undefined) {
-                    try { fs.closeSync(proc.logFd); } catch (e) { }
+                if (logFd !== undefined) {
+                    try {
+                        fs.closeSync(logFd);
+                    } catch (e) { }
                 }
 
                 delete activeProcesses[profileId];
-                await forceKill(proc.xrayPid);
+                await forceKill(pid);
 
                 // 性能优化：清理缓存文件，节省磁盘空间
                 try {
@@ -1910,18 +1824,8 @@ async function launchProfileCore(sender, profileId, watermarkStyle) {
                 }
 
                 if (sender && !sender.isDestroyed()) sender.send('profile-status', { id: profileId, status: 'stopped' });
-            });
-        }
-
-        // ====================================================================
-        // 关键：断开 Puppeteer 的 CDP 连接
-        // disconnect() 只断开 WebSocket，Chrome 浏览器继续正常运行。
-        // 这会消除所有 CDP 自动化痕迹（cdc_ 变量、Runtime bindings 等），
-        // 使浏览器在 Stripe/Cloudflare 检测中表现得与普通浏览器一致。
-        // ====================================================================
-        console.log(`[Anti-Detect] Disconnecting Puppeteer CDP for profile ${profileId.slice(0, 8)}...`);
-        browser.disconnect();
-        console.log(`[Anti-Detect] CDP disconnected. Browser running as native Chrome.`);
+            }
+        });
 
         return switchMsg;
     } catch (err) {
@@ -1935,15 +1839,7 @@ ipcMain.handle('launch-profile', async (event, profileId, watermarkStyle) => {
 });
 
 app.on('window-all-closed', () => {
-    Object.values(activeProcesses).forEach(p => {
-        forceKill(p.xrayPid);
-        // 清理 Chrome 进程
-        if (p.chromeProcess && !p.chromeProcess.killed) {
-            try { p.chromeProcess.kill(); } catch (e) { }
-        } else if (p.chromePid) {
-            forceKill(p.chromePid);
-        }
-    });
+    Object.values(activeProcesses).forEach(p => forceKill(p.xrayPid));
     if (process.platform !== 'darwin') app.quit();
 });
 
