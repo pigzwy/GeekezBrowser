@@ -1347,12 +1347,13 @@
     </div>
     <div id="confirmModal" class="modal-overlay" style="z-index: 2000;">
         <div class="modal-content">
-            <div class="modal-header" style="justify-content: center; border: none;"><span
-                    style="color: var(--danger); font-size: 40px;">⚠</span></div>
-            <p id="confirmMsg" style="margin: 10px 0 20px;">Msg</p>
+            <div class="modal-header" style="justify-content: center; border: none; padding-bottom: 0;"><span
+                    style="color: var(--accent); font-size: 40px;">🚀</span></div>
+            <p id="confirmMsg" style="margin: 10px 0 10px; text-align: center; font-weight: bold; font-size: 16px;">Msg</p>
+            <div id="confirmNotes" style="display: none; max-height: 200px; overflow-y: auto; text-align: left; font-size: 12px; margin-bottom: 20px; padding: 10px; background: rgba(0,0,0,0.2); border: 1px solid var(--border); border-radius: 6px; color: var(--text-secondary);"></div>
             <div style="display: flex; justify-content: center; gap: 15px;"><button class="outline"
-                    onclick="closeConfirm(false)">Cancel</button><button class="danger"
-                    onclick="closeConfirm(true)">Confirm</button></div>
+                    onclick="closeConfirm(false)" id="confirmNo">Cancel</button><button class="primary"
+                    onclick="closeConfirm(true)" id="confirmYes">Confirm</button></div>
         </div>
     </div>
     <div id="alertModal" class="modal-overlay" style="z-index: 2001;">
