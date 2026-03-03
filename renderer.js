@@ -398,7 +398,31 @@ function showAlert(msg, showBtn = true) {
     if (btn) btn.style.display = showBtn ? 'block' : 'none';
     document.getElementById('alertModal').style.display = 'flex';
 }
-function showConfirm(msg, callback) { document.getElementById('confirmMsg').innerText = msg; document.getElementById('confirmModal').style.display = 'flex'; confirmCallback = callback; }
+function resetConfirmDialog() {
+    const notesEl = document.getElementById('confirmNotes');
+    const yesBtn = document.getElementById('confirmYes');
+    const noBtn = document.getElementById('confirmNo');
+
+    if (notesEl) {
+        notesEl.style.display = 'none';
+        notesEl.innerHTML = '';
+    }
+    if (noBtn) {
+        noBtn.textContent = t('cancel') || 'Cancel';
+        noBtn.onclick = () => closeConfirm(false);
+    }
+    if (yesBtn) {
+        yesBtn.textContent = 'Confirm';
+        yesBtn.onclick = () => closeConfirm(true);
+    }
+}
+
+function showConfirm(msg, callback) {
+    resetConfirmDialog();
+    document.getElementById('confirmMsg').innerText = msg;
+    document.getElementById('confirmModal').style.display = 'flex';
+    confirmCallback = callback;
+}
 function closeConfirm(result) {
     document.getElementById('confirmModal').style.display = 'none';
     if (result && confirmCallback) confirmCallback();
@@ -570,6 +594,7 @@ function showUpdateConfirm(version, url, notes) {
     const notesEl = document.getElementById('confirmNotes');
     const yesBtn = document.getElementById('confirmYes');
     const noBtn = document.getElementById('confirmNo');
+    confirmCallback = null;
 
     msgEl.innerHTML = `${t('appUpdateFound')} (v${version})`;
 
@@ -578,6 +603,7 @@ function showUpdateConfirm(version, url, notes) {
         notesEl.style.display = 'block';
     } else {
         notesEl.style.display = 'none';
+        notesEl.innerHTML = '';
     }
 
     // Update button - go to download page
