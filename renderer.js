@@ -233,7 +233,7 @@ function renderHelpContent() {
     const aboutHTML = curLang === 'en' ?
         `<div style="text-align:center;margin-bottom:24px;padding:20px 0;">
             <div style="font-size:28px;font-weight:700;color:var(--text-primary);letter-spacing:1px;">Geek<span style="color:var(--accent);">EZ</span></div>
-            <div style="font-size:12px;opacity:0.5;margin-top:4px;">v1.3.4 · Anti-detect Browser</div>
+            <div style="font-size:12px;opacity:0.5;margin-top:4px;">v1.3.5 · Anti-detect Browser</div>
          </div>
          
          <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">
@@ -296,7 +296,7 @@ function renderHelpContent() {
          </div>` :
         `<div style="text-align:center;margin-bottom:24px;padding:20px 0;">
             <div style="font-size:28px;font-weight:700;color:var(--text-primary);letter-spacing:1px;">Geek<span style="color:var(--accent);">EZ</span></div>
-            <div style="font-size:12px;opacity:0.5;margin-top:4px;">v1.3.4 · 指纹浏览器</div>
+            <div style="font-size:12px;opacity:0.5;margin-top:4px;">v1.3.5 · 指纹浏览器</div>
          </div>
          
          <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">
@@ -496,7 +496,7 @@ async function checkUpdates() {
 
         if (appRes.update) {
             // Found App Update -> Show Confirm with Skip option
-            showUpdateConfirm(appRes.remote, appRes.url);
+            showUpdateConfirm(appRes.remote, appRes.url, appRes.notes);
             return;
         }
 
@@ -536,7 +536,7 @@ async function checkUpdatesSilent() {
             if (btn) btn.classList.add('has-update');
 
             // Auto popup for App update with Skip option
-            showUpdateConfirm(appRes.remote, appRes.url);
+            showUpdateConfirm(appRes.remote, appRes.url, appRes.notes);
             return;
         }
         const xrayRes = await window.electronAPI.invoke('check-xray-update');
@@ -549,14 +549,36 @@ async function checkUpdatesSilent() {
     }
 }
 
+// Simple markdown parser for release notes
+function parseMarkdown(md) {
+    if (!md) return '';
+    return md
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') // Escape HTML
+        .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>') // Bold
+        .replace(/\*(.*?)\*/g, '<em>$1</em>') // Italic
+        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="#" onclick="window.electronAPI.invoke(\'open-url\', \'$2\'); return false;" style="color:var(--accent);text-decoration:none;">$1</a>') // Links
+        .replace(/^\s*-\s+(.*)$/gm, '<li>$1</li>') // List items
+        .replace(/(<li>.*<\/li>)/s, '<ul style="padding-left: 20px; margin: 5px 0;">$1</ul>') // Wrap lists
+        .replace(/\n\n/g, '<br><br>') // Paragraphs
+        .replace(/\n/g, '<br>'); // Line breaks
+}
+
 // Show update confirm dialog with Skip option
-function showUpdateConfirm(version, url) {
+function showUpdateConfirm(version, url, notes) {
     const modal = document.getElementById('confirmModal');
-    const msgEl = document.getElementById('confirmMessage');
+    const msgEl = document.getElementById('confirmMsg');
+    const notesEl = document.getElementById('confirmNotes');
     const yesBtn = document.getElementById('confirmYes');
     const noBtn = document.getElementById('confirmNo');
 
-    msgEl.innerHTML = `${t('appUpdateFound')} (v${version})<br><br>${t('askUpdate')}?`;
+    msgEl.innerHTML = `${t('appUpdateFound')} (v${version})`;
+
+    if (notes) {
+        notesEl.innerHTML = parseMarkdown(notes);
+        notesEl.style.display = 'block';
+    } else {
+        notesEl.style.display = 'none';
+    }
 
     // Update button - go to download page
     yesBtn.textContent = t('goDownload') || '前往下载';

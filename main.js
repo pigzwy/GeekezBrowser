@@ -217,7 +217,6 @@ async function handleApiRequest(method, pathname, body, params) {
         // Align with in-app cleanup behavior (see: ipcMain.handle('delete-profile'))
         // activeProcesses stores { xrayPid, browser, logFd }, not necessarily a chromePid.
         await forceKill(proc.xrayPid);
-
         // Prefer Puppeteer browser.close() to shut down the window gracefully.
         try {
             if (proc.browser && typeof proc.browser.close === 'function') {
@@ -234,12 +233,13 @@ async function handleApiRequest(method, pathname, body, params) {
 
         // Close log file descriptor (Windows needs this)
         if (proc.logFd !== undefined) {
-            try {
-                fs.closeSync(proc.logFd);
-            } catch (e) { }
+            try { fs.closeSync(proc.logFd); } catch (e) { }
         }
 
         delete activeProcesses[profile.id];
+        if (mainWindow && mainWindow.webContents) {
+            mainWindow.webContents.send('profile-stopped', profile.id);
+        }
         await new Promise(r => setTimeout(r, 200));
         return { success: true, message: 'Profile stopped' };
     }
@@ -837,7 +837,7 @@ ipcMain.handle('test-proxy-latency', async (e, proxyStr) => {
     } catch (err) { return { success: false, msg: err.message }; }
 });
 ipcMain.handle('set-title-bar-color', (e, colors) => { const win = BrowserWindow.fromWebContents(e.sender); if (win) { if (process.platform === 'win32') try { win.setTitleBarOverlay({ color: colors.bg, symbolColor: colors.symbol }); } catch (e) { } win.setBackgroundColor(colors.bg); } });
-ipcMain.handle('check-app-update', async () => { try { const data = await fetchJson('https://api.github.com/repos/EchoHS/GeekezBrowser/releases/latest'); if (!data || !data.tag_name) return { update: false }; const remote = data.tag_name.replace('v', ''); if (compareVersions(remote, app.getVersion()) > 0) { return { update: true, remote, url: 'https://browser.geekez.net/#downloads' }; } return { update: false }; } catch (e) { return { update: false, error: e.message }; } });
+ipcMain.handle('check-app-update', async () => { try { const data = await fetchJson('https://api.github.com/repos/EchoHS/GeekezBrowser/releases/latest'); if (!data || !data.tag_name) return { update: false }; const remote = data.tag_name.replace('v', ''); if (compareVersions(remote, app.getVersion()) > 0) { return { update: true, remote, url: 'https://browser.geekez.net/#downloads', notes: data.body }; } return { update: false }; } catch (e) { return { update: false, error: e.message }; } });
 ipcMain.handle('check-xray-update', async () => { try { const data = await fetchJson('https://api.github.com/repos/XTLS/Xray-core/releases/latest'); if (!data || !data.tag_name) return { update: false }; const remoteVer = data.tag_name; const currentVer = await getLocalXrayVersion(); if (remoteVer !== currentVer) { let assetName = ''; const arch = os.arch(); const platform = os.platform(); if (platform === 'win32') assetName = `Xray-windows-${arch === 'x64' ? '64' : '32'}.zip`; else if (platform === 'darwin') assetName = `Xray-macos-${arch === 'arm64' ? 'arm64-v8a' : '64'}.zip`; else assetName = `Xray-linux-${arch === 'x64' ? '64' : '32'}.zip`; const downloadUrl = `https://gh-proxy.com/https://github.com/XTLS/Xray-core/releases/download/${remoteVer}/${assetName}`; return { update: true, remote: remoteVer.replace(/^v/, ''), downloadUrl }; } return { update: false }; } catch (e) { return { update: false }; } });
 ipcMain.handle('download-xray-update', async (e, url) => {
     const exeName = process.platform === 'win32' ? 'xray.exe' : 'xray';
