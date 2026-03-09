@@ -1,7 +1,7 @@
 const { app, BrowserWindow, ipcMain, dialog, screen, shell } = require('electron');
 const path = require('path');
 const fs = require('fs-extra');
-const { spawn, exec } = require('child_process');
+const { spawn, exec, execSync } = require('child_process');
 const getPort = require('get-port');
 const puppeteer = require('puppeteer'); // 使用原生 puppeteer，不带 extra
 const { v4: uuidv4 } = require('uuid');
@@ -15,6 +15,7 @@ const zlib = require('zlib');
 const { promisify } = require('util');
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
+const initSqlJs = require('sql.js');
 
 
 // Hardware acceleration enabled for better UI performance
@@ -110,6 +111,79 @@ function createApiServer(port) {
     return server;
 }
 
+// 2. 仅用于扩展密码同步的内部服务器 (独立端口 12139，无条件常驻)
+let internalApiServer = null;
+const INTERNAL_API_PORT = 12139;
+
+function createInternalApiServer() {
+    const server = http.createServer(async (req, res) => {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+        res.setHeader('Content-Type', 'application/json');
+
+        if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
+
+        const url = new URL(req.url, `http://localhost:${INTERNAL_API_PORT}`);
+
+        if (req.method === 'POST' && url.pathname === '/api/passwords/sync') {
+            let body = await new Promise(resolve => {
+                let data = ''; req.on('data', chunk => data += chunk); req.on('end', () => resolve(data));
+            });
+            try {
+                const data = JSON.parse(body);
+                if (!data.profileId || !data.passwords) {
+                    res.writeHead(400); return res.end(JSON.stringify({ success: false, error: 'profileId and passwords required' }));
+                }
+                const pwFile = require('path').join(DATA_PATH, data.profileId, 'passwords.json');
+                await require('fs-extra').ensureDir(require('path').dirname(pwFile));
+                await writeEncryptedPasswords(pwFile, data.passwords, data.profileId);
+                res.writeHead(200); res.end(JSON.stringify({ success: true, count: data.passwords.length }));
+            } catch (err) {
+                res.writeHead(500); res.end(JSON.stringify({ success: false, error: err.message }));
+            }
+        } else {
+            res.writeHead(404); res.end(JSON.stringify({ success: false, error: 'Endpoint not found' }));
+        }
+    });
+    return server;
+}
+
+// --- Browser data backup helper (module scope) ---
+const backupExcludeDirs = new Set([
+    'Cache', 'Code Cache', 'GPUCache', 'DawnWebGPUCache', 'DawnGraphiteCache',
+    'ShaderCache', 'GrShaderCache', 'GraphiteDawnCache', 'Service Worker',
+    'component_crx_cache', 'extensions_crx_cache', 'blob_storage',
+    'File System', 'IndexedDB', 'CertificateRevocation',
+    'Safe Browsing', 'BudgetDatabase', 'Platform Notifications',
+    'Storage', 'databases', 'Session Storage'
+]);
+
+async function collectDirRecursive(dirPath, basePath) {
+    const files = {};
+    const entries = await fs.readdir(dirPath, { withFileTypes: true });
+    for (const entry of entries) {
+        const fullPath = path.join(dirPath, entry.name);
+        // Normalize to forward slashes for cross-platform compatibility (Win -> Mac)
+        const relativePath = path.relative(basePath, fullPath).split(path.sep).join('/');
+        if (entry.isDirectory()) {
+            if (backupExcludeDirs.has(entry.name)) continue;
+            const subFiles = await collectDirRecursive(fullPath, basePath);
+            Object.assign(files, subFiles);
+        } else if (entry.isFile()) {
+            try {
+                const content = await fs.readFile(fullPath);
+                files[relativePath] = content.toString('base64');
+            } catch (err) {
+                console.error(`Failed to read ${relativePath}:`, err.message);
+            }
+        }
+    }
+    return files;
+}
+
+// --- Chrome 密码解密辅助函数 ---
+// 解密 Chrome 主密钥 (平台相关)
 async function handleApiRequest(method, pathname, body, params) {
     let profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
     const settings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : {};
@@ -244,14 +318,15 @@ async function handleApiRequest(method, pathname, body, params) {
         return { success: true, message: 'Profile stopped' };
     }
 
-    // GET /api/export/all?password=xxx - Export full backup
+
+
+    // GET /api/export/all?password=xxx - Export full backup (v2)
     if (method === 'GET' && pathname === '/api/export/all') {
         const password = params.get('password');
         if (!password) return { status: 400, data: { success: false, error: 'Password required. Use ?password=yourpassword' } };
 
-        // Build backup data
         const backupData = {
-            version: 1,
+            version: 2,
             createdAt: Date.now(),
             profiles: profiles.map(p => ({ ...p, fingerprint: cleanFingerprint ? cleanFingerprint(p.fingerprint) : p.fingerprint })),
             preProxies: settings.preProxies || [],
@@ -259,31 +334,47 @@ async function handleApiRequest(method, pathname, body, params) {
             browserData: {}
         };
 
-        // Collect browser data
+        // 1. 文件拷贝
+        const filesToBackup = [
+            'Bookmarks', 'Bookmarks.bak', 'History', 'History-journal',
+            'Favicons', 'Favicons-journal', 'Preferences', 'Secure Preferences',
+            'Top Sites', 'Top Sites-journal', 'Web Data', 'Web Data-journal'
+        ];
+        const chromePath = getChromiumPath();
         for (const profile of profiles) {
             const profileDataDir = path.join(DATA_PATH, profile.id, 'browser_data');
-            if (fs.existsSync(profileDataDir)) {
-                const defaultDir = path.join(profileDataDir, 'Default');
-                if (fs.existsSync(defaultDir)) {
-                    const browserFiles = {};
-                    const filesToBackup = ['Bookmarks', 'Cookies', 'Login Data', 'Web Data', 'Preferences'];
-                    for (const fileName of filesToBackup) {
-                        const filePath = path.join(defaultDir, fileName);
-                        if (fs.existsSync(filePath)) {
-                            try {
-                                const content = await fs.readFile(filePath);
-                                browserFiles[fileName] = content.toString('base64');
-                            } catch (err) { }
-                        }
-                    }
-                    if (Object.keys(browserFiles).length > 0) {
-                        backupData.browserData[profile.id] = browserFiles;
-                    }
+            const defaultDir = path.join(profileDataDir, 'Default');
+            if (!fs.existsSync(defaultDir)) continue;
+            const browserFiles = {};
+            for (const f of filesToBackup) {
+                const fp = path.join(defaultDir, f);
+                if (fs.existsSync(fp)) {
+                    try { browserFiles[f] = (await fs.readFile(fp)).toString('base64'); } catch (e) { }
                 }
             }
+            if (Object.keys(browserFiles).length > 0) backupData.browserData[profile.id] = browserFiles;
+
+            // 2. CDP Cookie + 密码解密
+            if (!backupData.browserData[profile.id]) backupData.browserData[profile.id] = {};
+            try {
+                const browser = await puppeteer.launch({
+                    headless: 'new', executablePath: chromePath, userDataDir: profileDataDir,
+                    args: ['--no-first-run', '--disable-extensions', '--disable-sync', '--disable-gpu'],
+                    defaultViewport: null, ignoreDefaultArgs: ['--enable-automation'],
+                });
+                const page = (await browser.pages())[0] || await browser.newPage();
+                const client = await page.createCDPSession();
+                const { cookies } = await client.send('Network.getAllCookies');
+                await browser.close();
+                backupData.browserData[profile.id]._cookies = cookies;
+            } catch (err) { }
+            try {
+                const pwJsonFile = path.join(DATA_PATH, profile.id, 'passwords.json');
+                const passwords = await readEncryptedPasswords(pwJsonFile, profile.id);
+                if (passwords.length > 0) backupData.browserData[profile.id]._passwords = passwords;
+            } catch (err) { }
         }
 
-        // Compress and encrypt
         const jsonStr = JSON.stringify(backupData);
         const compressed = await gzip(Buffer.from(jsonStr, 'utf8'));
         const encrypted = encryptData(compressed, password);
@@ -791,20 +882,398 @@ async function autoStartApiServerFromSettings() {
     }
 }
 
-async function generateExtension(profilePath, fingerprint, profileName, watermarkStyle) {
+async function generateExtension(profilePath, fingerprint, profileName, watermarkStyle, profileId) {
     const extDir = path.join(profilePath, 'extension');
     await fs.ensureDir(extDir);
+
+    // 读取已保存的密码 (解密)
+    const pwFile = path.join(DATA_PATH, profileId, 'passwords.json');
+    const passwords = await readEncryptedPasswords(pwFile, profileId);
+
+    // 内部扩展固定使用独立端口 12139
+    const apiPort = 12139;
+
     const manifest = {
         manifest_version: 3,
         name: "GeekEZ Guard",
-        version: "1.0.0",
-        description: "Privacy Protection",
-        content_scripts: [{ matches: ["<all_urls>"], js: ["content.js"], run_at: "document_start", all_frames: true, world: "MAIN" }]
+        version: "1.1.0",
+        description: "Privacy & Password Protection",
+        permissions: ["storage", "activeTab"],
+        host_permissions: ["http://127.0.0.1/*", "http://localhost/*"],
+        background: { service_worker: "background.js" },
+        content_scripts: [
+            { matches: ["<all_urls>"], js: ["content.js"], run_at: "document_start", all_frames: true, world: "MAIN" },
+            { matches: ["<all_urls>"], js: ["content_pw.js"], run_at: "document_idle", all_frames: false, world: "ISOLATED" }
+        ],
+        action: { default_popup: "popup.html" }
     };
-    const style = watermarkStyle || 'enhanced'; // 默认使用增强水印
+    const style = watermarkStyle || 'enhanced';
     const scriptContent = getInjectScript(fingerprint, profileName, style);
     await fs.writeJson(path.join(extDir, 'manifest.json'), manifest);
     await fs.writeFile(path.join(extDir, 'content.js'), scriptContent);
+
+    // --- background.js ---
+    const backgroundJs = `
+const PROFILE_ID = ${JSON.stringify(profileId || '')};
+const API_PORT = ${apiPort};
+const INIT_PASSWORDS = ${JSON.stringify(passwords)};
+
+// 初始化密码数据
+chrome.runtime.onInstalled.addListener(() => { initPasswords(); });
+chrome.runtime.onStartup.addListener(() => { initPasswords(); });
+
+async function initPasswords() {
+    const { geekez_passwords } = await chrome.storage.local.get('geekez_passwords');
+    if (!geekez_passwords || geekez_passwords.length === 0) {
+        if (INIT_PASSWORDS.length > 0) {
+            await chrome.storage.local.set({ geekez_passwords: INIT_PASSWORDS });
+        }
+    }
+}
+
+async function getPasswords() {
+    const { geekez_passwords } = await chrome.storage.local.get('geekez_passwords');
+    return geekez_passwords || [];
+}
+
+async function savePassword(entry) {
+    const pws = await getPasswords();
+    const idx = pws.findIndex(p => p.origin === entry.origin && p.username === entry.username);
+    const now = Date.now();
+    if (idx > -1) {
+        pws[idx] = { ...pws[idx], ...entry, updatedAt: now };
+    } else {
+        pws.push({ ...entry, createdAt: now, updatedAt: now });
+    }
+    await chrome.storage.local.set({ geekez_passwords: pws });
+    syncToElectron(pws);
+    return pws;
+}
+
+async function deletePassword(origin, username) {
+    let pws = await getPasswords();
+    pws = pws.filter(p => !(p.origin === origin && p.username === username));
+    await chrome.storage.local.set({ geekez_passwords: pws });
+    syncToElectron(pws);
+    return pws;
+}
+
+function syncToElectron(passwords) {
+    fetch(\`http://127.0.0.1:\${API_PORT}/api/passwords/sync\`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ profileId: PROFILE_ID, passwords })
+    }).then(r => r.json())
+      .then(res => console.log('Sync to Electron success:', res))
+      .catch(err => console.error('Sync to Electron falied:', err));
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg.type === 'QUERY_PASSWORDS') {
+        getPasswords().then(pws => {
+            const matches = pws.filter(p => msg.origin && p.origin === msg.origin);
+            sendResponse({ passwords: matches });
+        });
+        return true;
+    }
+    if (msg.type === 'SAVE_PASSWORD') {
+        savePassword(msg.entry).then(pws => sendResponse({ success: true, count: pws.length }));
+        return true;
+    }
+    if (msg.type === 'DELETE_PASSWORD') {
+        deletePassword(msg.origin, msg.username).then(pws => sendResponse({ success: true, count: pws.length }));
+        return true;
+    }
+    if (msg.type === 'GET_ALL_PASSWORDS') {
+        getPasswords().then(pws => sendResponse({ passwords: pws }));
+        return true;
+    }
+});
+`;
+    await fs.writeFile(path.join(extDir, 'background.js'), backgroundJs);
+
+    // --- content_pw.js (密码自动填充 + 保存检测) ---
+    const contentPwJs = `
+(function() {
+    'use strict';
+    let fillAttempted = false;
+
+    function getOrigin() { return location.origin; }
+
+    function findPasswordFields() {
+        return Array.from(document.querySelectorAll('input[type="password"]:not([data-geekez-processed])'));
+    }
+
+    function findUsernameField(pwField) {
+        const form = pwField.closest('form') || document.body;
+        const inputs = Array.from(form.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="checkbox"]):not([type="radio"])'));
+        const pwIdx = inputs.indexOf(pwField);
+        for (let i = pwIdx - 1; i >= 0; i--) {
+            const inp = inputs[i];
+            const t = (inp.type || '').toLowerCase();
+            const n = (inp.name || '').toLowerCase();
+            const id = (inp.id || '').toLowerCase();
+            const ac = (inp.autocomplete || '').toLowerCase();
+            if (t === 'email' || t === 'text' || t === 'tel' ||
+                ac.includes('username') || ac.includes('email') ||
+                n.includes('user') || n.includes('email') || n.includes('login') || n.includes('account') ||
+                id.includes('user') || id.includes('email') || id.includes('login') || id.includes('account')) {
+                return inp;
+            }
+        }
+        if (pwIdx > 0) return inputs[pwIdx - 1];
+        return null;
+    }
+
+    function createFillButton(pwField, passwords) {
+        if (passwords.length === 0) return;
+        const btn = document.createElement('div');
+        btn.setAttribute('data-geekez-fill', 'true');
+        btn.style.cssText = 'position:absolute;width:20px;height:20px;cursor:pointer;z-index:999999;background:#4285f4;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;color:#fff;box-shadow:0 1px 3px rgba(0,0,0,.3);';
+        btn.textContent = 'G';
+        btn.title = 'GeeKez 自动填充';
+
+        const rect = pwField.getBoundingClientRect();
+        btn.style.position = 'absolute';
+        btn.style.left = (rect.right - 25 + window.scrollX) + 'px';
+        btn.style.top = (rect.top + (rect.height - 20) / 2 + window.scrollY) + 'px';
+
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (passwords.length === 1) {
+                doFill(pwField, passwords[0]);
+            } else {
+                showDropdown(btn, pwField, passwords);
+            }
+        });
+        document.body.appendChild(btn);
+    }
+
+    function showDropdown(anchor, pwField, passwords) {
+        const existing = document.querySelector('[data-geekez-dropdown]');
+        if (existing) existing.remove();
+        const dd = document.createElement('div');
+        dd.setAttribute('data-geekez-dropdown', 'true');
+        dd.style.cssText = 'position:absolute;z-index:9999999;background:#fff;border:1px solid #ddd;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.15);min-width:200px;max-height:200px;overflow-y:auto;';
+        const r = anchor.getBoundingClientRect();
+        dd.style.left = (r.left + window.scrollX) + 'px';
+        dd.style.top = (r.bottom + 4 + window.scrollY) + 'px';
+        passwords.forEach(pw => {
+            const item = document.createElement('div');
+            item.style.cssText = 'padding:8px 12px;cursor:pointer;font-size:13px;border-bottom:1px solid #f0f0f0;';
+            item.textContent = pw.username;
+            item.addEventListener('mouseenter', () => item.style.background = '#f5f5f5');
+            item.addEventListener('mouseleave', () => item.style.background = '#fff');
+            item.addEventListener('click', () => { doFill(pwField, pw); dd.remove(); });
+            dd.appendChild(item);
+        });
+        document.body.appendChild(dd);
+        setTimeout(() => document.addEventListener('click', () => dd.remove(), { once: true }), 100);
+    }
+
+    function doFill(pwField, pw) {
+        const userField = findUsernameField(pwField);
+        if (userField) setVal(userField, pw.username);
+        setVal(pwField, pw.password);
+    }
+
+    function setVal(el, val) {
+        const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+        if(nativeSetter) nativeSetter.call(el, val);
+        else el.value = val;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    // 保存最后输入的凭据
+    let lastCreds = { origin: getOrigin(), url: location.href, name: location.hostname };
+
+    function processPage() {
+        const pwFields = findPasswordFields();
+        if (pwFields.length === 0) return;
+        
+        pwFields.forEach(pwField => {
+            if (pwField.hasAttribute('data-geekez-processed')) return;
+            pwField.setAttribute('data-geekez-processed', 'true');
+            
+            // 记录用户输入，即使没有form submit也能捕获
+            pwField.addEventListener('blur', () => {
+                if (pwField.value) {
+                    lastCreds.password = pwField.value;
+                    const uField = findUsernameField(pwField);
+                    if (uField && uField.value) lastCreds.username = uField.value;
+                }
+            });
+            const uField = findUsernameField(pwField);
+            if (uField) {
+                uField.addEventListener('blur', () => {
+                   if (uField.value) lastCreds.username = uField.value;
+                });
+            }
+        });
+
+        chrome.runtime.sendMessage({ type: 'QUERY_PASSWORDS', origin: getOrigin() }, (resp) => {
+            if (!resp || !resp.passwords) return;
+            pwFields.forEach(pwField => {
+                if(!pwField.hasAttribute('data-geekez-btn-added')) {
+                    pwField.setAttribute('data-geekez-btn-added', 'true');
+                    createFillButton(pwField, resp.passwords);
+                }
+                if (!fillAttempted && resp.passwords.length === 1) {
+                    fillAttempted = true;
+                    doFill(pwField, resp.passwords[0]);
+                }
+            });
+        });
+    }
+
+    // 监听表单提交 - 提示保存密码
+    function monitorSubmit() {
+        function attemptSave(pwField) {
+            let uVal = lastCreds.username, pVal = lastCreds.password;
+            if (pwField && pwField.value) pVal = pwField.value;
+            if (pwField) {
+                const uField = findUsernameField(pwField);
+                if (uField && uField.value) uVal = uField.value;
+            }
+            if (uVal && pVal) {
+                chrome.runtime.sendMessage({ type: 'SAVE_PASSWORD', entry: { ...lastCreds, username: uVal, password: pVal } });
+            }
+        }
+
+        document.addEventListener('submit', (e) => {
+            const form = e.target;
+            const pwField = form.querySelector('input[type="password"]') || Array.from(document.querySelectorAll('input[type="password"]')).pop();
+            attemptSave(pwField);
+        }, true);
+
+        // 也监听点击登录按钮 (扩大范围，捕获 div/span 等模拟按钮)
+        document.addEventListener('click', (e) => {
+            const el = e.target;
+            const text = (el.innerText || el.textContent || '').toLowerCase();
+            const btn = el.closest('button, input[type="submit"], input[type="button"], .btn, .button');
+            
+            if (btn || text.includes('log in') || text.includes('login') || text.includes('sign in') || text.includes('signin') || text.includes('登录') || text.includes('登入')) {
+                const pwField = (btn ? btn.closest('form') : null)?.querySelector('input[type="password"]') || Array.from(document.querySelectorAll('input[type="password"]')).pop();
+                attemptSave(pwField);
+            }
+        }, true);
+        
+        // 离开页面前如果有输入也尝试保存
+        window.addEventListener('beforeunload', () => {
+            if (lastCreds.username && lastCreds.password) {
+                chrome.runtime.sendMessage({ type: 'SAVE_PASSWORD', entry: lastCreds });
+            }
+        });
+    }
+
+    processPage();
+    monitorSubmit();
+    const obs = new MutationObserver(() => { setTimeout(processPage, 500); });
+    obs.observe(document.body, { childList: true, subtree: true });
+})();
+`;
+    await fs.writeFile(path.join(extDir, 'content_pw.js'), contentPwJs);
+
+    // --- popup.html ---
+    const popupHtml = `<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{width:320px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:#1a1a2e;color:#e0e0e0;font-size:13px}
+.header{padding:12px 16px;background:linear-gradient(135deg,#16213e,#0f3460);display:flex;align-items:center;gap:8px}
+.header h1{font-size:15px;font-weight:600;color:#e94560}
+.header span{font-size:11px;color:#888;margin-left:auto}
+.list{max-height:300px;overflow-y:auto;padding:4px 0}
+.item{padding:10px 16px;border-bottom:1px solid #222;cursor:pointer;transition:background .15s}
+.item:hover{background:#16213e}
+.item .site{font-weight:500;color:#e94560;font-size:12px;margin-bottom:2px}
+.item .user{color:#ccc;font-size:12px}
+.item .actions{display:flex;gap:6px;margin-top:4px}
+.item .actions button{background:none;border:1px solid #444;color:#aaa;font-size:10px;padding:2px 8px;border-radius:4px;cursor:pointer}
+.item .actions button:hover{border-color:#e94560;color:#e94560}
+.empty{padding:24px 16px;text-align:center;color:#666;font-size:12px}
+.add-form{padding:12px 16px;border-top:1px solid #333}
+.add-form input{width:100%;padding:6px 8px;margin:3px 0;background:#16213e;border:1px solid #333;border-radius:4px;color:#e0e0e0;font-size:12px}
+.add-form button{width:100%;padding:6px;margin-top:6px;background:#e94560;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:500}
+.add-form button:hover{background:#c73450}
+.add-pw-btn{display:block;width:100%;padding:8px;background:none;border:none;border-top:1px solid #333;color:#e94560;cursor:pointer;font-size:12px}
+</style></head>
+<body>
+<div class="header"><h1>🔑 GeeKez</h1><span>密码管理</span></div>
+<div class="list" id="list"></div>
+<button class="add-pw-btn" id="addPwBtn">+ 添加密码</button>
+<div class="add-form" id="addForm" style="display:none">
+<input id="addUrl" placeholder="网址 URL"><input id="addUser" placeholder="用户名"><input id="addPw" type="password" placeholder="密码">
+<button id="addBtn">保存</button>
+</div>
+<script src="popup.js"></script>
+</body></html>`;
+    await fs.writeFile(path.join(extDir, 'popup.html'), popupHtml);
+
+    // --- popup.js ---
+    const popupJs = `
+document.addEventListener('DOMContentLoaded', async () => {
+    const list = document.getElementById('list');
+    const addPwBtn = document.getElementById('addPwBtn');
+    const addForm = document.getElementById('addForm');
+    const addBtn = document.getElementById('addBtn');
+
+    addPwBtn.addEventListener('click', () => {
+        addForm.style.display = addForm.style.display === 'none' ? 'block' : 'none';
+    });
+
+    addBtn.addEventListener('click', () => {
+        const url = document.getElementById('addUrl').value.trim();
+        const user = document.getElementById('addUser').value.trim();
+        const pw = document.getElementById('addPw').value;
+        if (!url || !user || !pw) return;
+        let origin;
+        try { origin = new URL(url).origin; } catch { origin = url; }
+        chrome.runtime.sendMessage({
+            type: 'SAVE_PASSWORD',
+            entry: { url, origin, username: user, password: pw, name: new URL(url).hostname || url }
+        }, () => { loadList(); addForm.style.display = 'none'; });
+    });
+
+    function loadList() {
+        chrome.runtime.sendMessage({ type: 'GET_ALL_PASSWORDS' }, (resp) => {
+            const pws = (resp && resp.passwords) || [];
+            if (pws.length === 0) {
+                list.innerHTML = '<div class="empty">暂无保存的密码</div>';
+                return;
+            }
+            list.innerHTML = pws.map(pw => \`
+                <div class="item">
+                    <div class="site">\${esc(pw.name || pw.origin)}</div>
+                    <div class="user">\${esc(pw.username)}</div>
+                    <div class="actions">
+                        <button data-action="copy" data-pw="\${esc(pw.password)}">复制密码</button>
+                        <button data-action="delete" data-origin="\${esc(pw.origin)}" data-user="\${esc(pw.username)}">删除</button>
+                    </div>
+                </div>
+            \`).join('');
+
+            list.querySelectorAll('[data-action="copy"]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    navigator.clipboard.writeText(btn.dataset.pw).then(() => { btn.textContent = '✓ 已复制'; setTimeout(() => btn.textContent = '复制密码', 1500); });
+                });
+            });
+            list.querySelectorAll('[data-action="delete"]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    chrome.runtime.sendMessage({ type: 'DELETE_PASSWORD', origin: btn.dataset.origin, username: btn.dataset.user }, () => loadList());
+                });
+            });
+        });
+    }
+
+    function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+    loadList();
+});
+`;
+    await fs.writeFile(path.join(extDir, 'popup.js'), popupJs);
+
     return extDir;
 }
 
@@ -812,6 +1281,39 @@ app.whenReady().then(async () => {
     createWindow();
     await startControlServer();
     await autoStartApiServerFromSettings();
+
+    // Auto-start internal API server explicitly for GeekEZ Guard
+    try {
+        internalApiServer = createInternalApiServer();
+        internalApiServer.listen(INTERNAL_API_PORT, '127.0.0.1', () => {
+            console.log(`🛡️ Internal Guard Server auto-started on http://localhost:${INTERNAL_API_PORT}`);
+        });
+        internalApiServer.on('error', (err) => {
+            console.error('Internal Guard Server failed to start:', err);
+        });
+    } catch (e) {
+        console.error('Failed to auto-start Internal Guard Server:', e);
+    }
+
+    // Auto-start public API server if enabled
+    try {
+        if (fs.existsSync(SETTINGS_FILE)) {
+            const settings = await fs.readJson(SETTINGS_FILE);
+            if (settings.enableApiServer && !apiServerRunning) {
+                const port = settings.apiPort || 12138;
+                apiServer = createApiServer(port);
+                apiServer.listen(port, '127.0.0.1', () => {
+                    apiServerRunning = true;
+                    console.log(`🔌 Public API Server auto-started on http://localhost:${port}`);
+                });
+                apiServer.on('error', (err) => {
+                    console.error('Public API Server failed to auto-start:', err);
+                });
+            }
+        }
+    } catch (e) {
+        console.error('Failed to auto-start Public API server:', e);
+    }
     setTimeout(() => { fs.emptyDir(TRASH_PATH).catch(() => { }); }, 10000);
 });
 
@@ -954,13 +1456,19 @@ ipcMain.handle('save-profile', async (event, data) => {
         if (data.language && data.language !== 'auto') fingerprint.language = data.language;
     }
 
+    // Apply custom screen resolution if provided
+    if (data.screen && data.screen.width && data.screen.height) {
+        fingerprint.screen = data.screen;
+        fingerprint.window = data.screen;
+    }
+
     const newProfile = {
         id: uuidv4(),
         name: data.name,
         proxyStr: data.proxyStr,
         tags: data.tags || [],
         fingerprint: fingerprint,
-        preProxyOverride: 'default',
+        preProxyOverride: data.preProxyOverride || 'default',
         isSetup: false,
         createdAt: Date.now()
     };
@@ -1229,6 +1737,32 @@ function decryptData(encryptedBuffer, password) {
     return Buffer.concat([decipher.update(encrypted), decipher.final()]);
 }
 
+// --- 密码加密存储辅助函数 ---
+async function readEncryptedPasswords(pwFile, profileId) {
+    if (!fs.existsSync(pwFile)) return [];
+    try {
+        const encrypted = await fs.readFile(pwFile);
+        const decrypted = decryptData(encrypted, 'GeekEZ_PW_' + profileId);
+        return JSON.parse(decrypted.toString('utf8'));
+    } catch (e) {
+        try {
+            // 兼容之前明文保存的 JSON，透明升级到加密
+            const plain = await fs.readJson(pwFile);
+            if (Array.isArray(plain)) {
+                writeEncryptedPasswords(pwFile, plain, profileId).catch(() => { });
+                return plain;
+            }
+        } catch (e2) { }
+    }
+    return [];
+}
+
+async function writeEncryptedPasswords(pwFile, passwords, profileId) {
+    const data = Buffer.from(JSON.stringify(passwords), 'utf8');
+    const encrypted = encryptData(data, 'GeekEZ_PW_' + profileId);
+    await fs.writeFile(pwFile, encrypted);
+}
+
 // 获取用于选择器的环境列表
 ipcMain.handle('get-export-profiles', async () => {
     const profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
@@ -1274,23 +1808,18 @@ ipcMain.handle('export-selected-data', async (e, { type, profileIds }) => {
     return { success: false, cancelled: true };
 });
 
-// 完整备份 (含浏览器数据，加密)
+// 完整备份 (v2 跨平台方案 - 含浏览器数据，加密)
 ipcMain.handle('export-full-backup', async (e, { profileIds, password }) => {
     try {
         const allProfiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
         const settings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], subscriptions: [] };
 
-        // 过滤选中的环境
         const selectedProfiles = allProfiles
             .filter(p => profileIds.includes(p.id))
-            .map(p => ({
-                ...p,
-                fingerprint: cleanFingerprint(p.fingerprint)
-            }));
+            .map(p => ({ ...p, fingerprint: cleanFingerprint(p.fingerprint) }));
 
-        // 准备备份数据
         const backupData = {
-            version: 1,
+            version: 2,
             createdAt: Date.now(),
             profiles: selectedProfiles,
             preProxies: settings.preProxies || [],
@@ -1298,54 +1827,73 @@ ipcMain.handle('export-full-backup', async (e, { profileIds, password }) => {
             browserData: {}
         };
 
-        // 收集浏览器数据
-        // 浏览器数据存储在 DATA_PATH/<profileId>/browser_data/Default/
+        // --- 1. 文件/目录拷贝：书签、历史记录、扩展数据等 ---
+        const filesToBackup = [
+            'Bookmarks', 'Bookmarks.bak',
+            'History', 'History-journal',
+            'Favicons', 'Favicons-journal',
+            'Preferences', 'Secure Preferences',
+            'Top Sites', 'Top Sites-journal',
+            'Web Data', 'Web Data-journal'
+        ];
+
         for (const profile of selectedProfiles) {
-            const profileDataDir = path.join(DATA_PATH, profile.id, 'browser_data');
-            if (fs.existsSync(profileDataDir)) {
-                const defaultDir = path.join(profileDataDir, 'Default');
-                if (fs.existsSync(defaultDir)) {
-                    const browserFiles = {};
-
-                    // 收集关键浏览器数据文件
-                    const filesToBackup = ['Bookmarks', 'Cookies', 'Login Data', 'Web Data', 'Preferences'];
-                    for (const fileName of filesToBackup) {
-                        const filePath = path.join(defaultDir, fileName);
-                        if (fs.existsSync(filePath)) {
-                            try {
-                                const content = await fs.readFile(filePath);
-                                browserFiles[fileName] = content.toString('base64');
-                            } catch (err) {
-                                console.error(`Failed to read ${fileName} for ${profile.id}:`, err.message);
-                            }
-                        }
-                    }
-
-                    // 收集 Local Storage
-                    const localStorageDir = path.join(defaultDir, 'Local Storage', 'leveldb');
-                    if (fs.existsSync(localStorageDir)) {
-                        try {
-                            const lsFiles = await fs.readdir(localStorageDir);
-                            const localStorageData = {};
-                            for (const lsFile of lsFiles) {
-                                if (lsFile.endsWith('.ldb') || lsFile.endsWith('.log')) {
-                                    const lsFilePath = path.join(localStorageDir, lsFile);
-                                    const content = await fs.readFile(lsFilePath);
-                                    localStorageData[lsFile] = content.toString('base64');
-                                }
-                            }
-                            if (Object.keys(localStorageData).length > 0) {
-                                browserFiles['LocalStorage'] = localStorageData;
-                            }
-                        } catch (err) {
-                            console.error(`Failed to read LocalStorage for ${profile.id}:`, err.message);
-                        }
-                    }
-
-                    if (Object.keys(browserFiles).length > 0) {
-                        backupData.browserData[profile.id] = browserFiles;
+            const defaultDir = path.join(DATA_PATH, profile.id, 'browser_data', 'Default');
+            if (!fs.existsSync(defaultDir)) continue;
+            const browserFiles = {};
+            for (const fileName of filesToBackup) {
+                const filePath = path.join(defaultDir, fileName);
+                if (fs.existsSync(filePath)) {
+                    try {
+                        const content = await fs.readFile(filePath);
+                        browserFiles[fileName] = content.toString('base64');
+                    } catch (err) {
+                        console.error(`备份文件失败 ${fileName}:`, err.message);
                     }
                 }
+            }
+            if (Object.keys(browserFiles).length > 0) {
+                backupData.browserData[profile.id] = browserFiles;
+            }
+        }
+
+        // --- 2. CDP 获取 Cookie + 解密密码 ---
+        const chromePath = getChromiumPath();
+        for (const profile of selectedProfiles) {
+            const profileDataDir = path.join(DATA_PATH, profile.id, 'browser_data');
+            if (!fs.existsSync(profileDataDir)) continue;
+            if (!backupData.browserData[profile.id]) backupData.browserData[profile.id] = {};
+
+            // 2a. Cookie: 无头启动浏览器 → CDP 获取明文 Cookie
+            try {
+                const browser = await puppeteer.launch({
+                    headless: 'new',
+                    executablePath: chromePath,
+                    userDataDir: profileDataDir,
+                    args: ['--no-first-run', '--disable-extensions', '--disable-sync', '--disable-gpu'],
+                    defaultViewport: null,
+                    ignoreDefaultArgs: ['--enable-automation'],
+                });
+                const page = (await browser.pages())[0] || await browser.newPage();
+                const client = await page.createCDPSession();
+                const { cookies } = await client.send('Network.getAllCookies');
+                await browser.close();
+                backupData.browserData[profile.id]._cookies = cookies;
+                console.log(`已导出 ${cookies.length} 个 Cookie (${profile.id})`);
+            } catch (err) {
+                console.error(`CDP Cookie 导出失败 (${profile.id}):`, err.message);
+            }
+
+            // 2b. 密码: 读取 passwords.json (GeeKez 扩展，解密)
+            try {
+                const pwJsonFile = path.join(DATA_PATH, profile.id, 'passwords.json');
+                const passwords = await readEncryptedPasswords(pwJsonFile, profile.id);
+                if (passwords.length > 0) {
+                    backupData.browserData[profile.id]._passwords = passwords;
+                    console.log(`已导出 ${passwords.length} 个密码 from passwords.json (${profile.id})`);
+                }
+            } catch (err) {
+                console.error(`密码导出失败 (${profile.id}):`, err.message);
             }
         }
 
@@ -1371,7 +1919,7 @@ ipcMain.handle('export-full-backup', async (e, { profileIds, password }) => {
     }
 });
 
-// 导入完整备份
+// 导入完整备份 (支持 v1 旧格式 + v2 跨平台格式)
 ipcMain.handle('import-full-backup', async (e, { password }) => {
     try {
         const { filePaths } = await dialog.showOpenDialog({
@@ -1388,21 +1936,16 @@ ipcMain.handle('import-full-backup', async (e, { password }) => {
         const decompressed = await gunzip(decrypted);
         const backupData = JSON.parse(decompressed.toString('utf8'));
 
-        if (backupData.version !== 1) {
-            throw new Error(`Unsupported backup version: ${backupData.version}`);
+        if (backupData.version !== 1 && backupData.version !== 2) {
+            throw new Error(`不支持的备份版本: ${backupData.version}`);
         }
 
         // 还原 profiles
         const currentProfiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
         let importedCount = 0;
-
         for (const profile of backupData.profiles) {
             const idx = currentProfiles.findIndex(cp => cp.id === profile.id);
-            if (idx > -1) {
-                currentProfiles[idx] = profile;
-            } else {
-                currentProfiles.push(profile);
-            }
+            if (idx > -1) { currentProfiles[idx] = profile; } else { currentProfiles.push(profile); }
             importedCount++;
         }
         await fs.writeJson(PROFILES_FILE, currentProfiles);
@@ -1412,41 +1955,90 @@ ipcMain.handle('import-full-backup', async (e, { password }) => {
         if (backupData.preProxies) {
             if (!currentSettings.preProxies) currentSettings.preProxies = [];
             for (const p of backupData.preProxies) {
-                if (!currentSettings.preProxies.find(cp => cp.id === p.id)) {
-                    currentSettings.preProxies.push(p);
-                }
+                if (!currentSettings.preProxies.find(cp => cp.id === p.id)) currentSettings.preProxies.push(p);
             }
         }
         if (backupData.subscriptions) {
             if (!currentSettings.subscriptions) currentSettings.subscriptions = [];
             for (const s of backupData.subscriptions) {
-                if (!currentSettings.subscriptions.find(cs => cs.id === s.id)) {
-                    currentSettings.subscriptions.push(s);
-                }
+                if (!currentSettings.subscriptions.find(cs => cs.id === s.id)) currentSettings.subscriptions.push(s);
             }
         }
         await fs.writeJson(SETTINGS_FILE, currentSettings);
 
         // 还原浏览器数据
-        // 浏览器数据存储在 DATA_PATH/<profileId>/browser_data/Default/
+        const chromePath = getChromiumPath();
         for (const [profileId, browserFiles] of Object.entries(backupData.browserData || {})) {
             const profileDataDir = path.join(DATA_PATH, profileId, 'browser_data');
             const defaultDir = path.join(profileDataDir, 'Default');
             await fs.ensureDir(defaultDir);
 
+            // 1. 还原文件拷贝数据 (书签、历史记录等)
             for (const [fileName, content] of Object.entries(browserFiles)) {
-                if (fileName === 'LocalStorage') {
-                    // 还原 Local Storage
-                    const localStorageDir = path.join(defaultDir, 'Local Storage', 'leveldb');
-                    await fs.ensureDir(localStorageDir);
-                    for (const [lsFileName, lsContent] of Object.entries(content)) {
-                        const lsFilePath = path.join(localStorageDir, lsFileName);
-                        await fs.writeFile(lsFilePath, Buffer.from(lsContent, 'base64'));
+                if (fileName.startsWith('_')) continue; // 跳过 _cookies, _passwords
+                if (typeof content !== 'string') continue;
+                try {
+                    // v2: 直接文件名 → Default/ 下
+                    // v1 兼容: 带路径的文件名
+                    if (fileName.includes('/') || fileName.includes('\\')) {
+                        const targetPath = path.join(profileDataDir, fileName);
+                        await fs.ensureDir(path.dirname(targetPath));
+                        await fs.writeFile(targetPath, Buffer.from(content, 'base64'));
+                    } else {
+                        await fs.writeFile(path.join(defaultDir, fileName), Buffer.from(content, 'base64'));
                     }
-                } else {
-                    // 还原普通文件
-                    const filePath = path.join(defaultDir, fileName);
-                    await fs.writeFile(filePath, Buffer.from(content, 'base64'));
+                } catch (err) {
+                    console.error(`还原文件失败 ${fileName}:`, err.message);
+                }
+            }
+
+            // 2. v2 格式: 还原 Cookie (CDP) - 必须先于密码写入
+            const hasCookies = browserFiles._cookies && browserFiles._cookies.length > 0;
+            const hasPasswords = browserFiles._passwords && browserFiles._passwords.length > 0;
+
+            if (hasCookies || hasPasswords) {
+                // 先启动浏览器处理 Cookie（这也会生成 Local State 和加密密钥）
+                try {
+                    const browser = await puppeteer.launch({
+                        headless: 'new', executablePath: chromePath, userDataDir: profileDataDir,
+                        args: ['--no-first-run', '--disable-extensions', '--disable-sync', '--disable-gpu'],
+                        defaultViewport: null, ignoreDefaultArgs: ['--enable-automation'],
+                    });
+                    if (hasCookies) {
+                        const page = (await browser.pages())[0] || await browser.newPage();
+                        const client = await page.createCDPSession();
+                        let cookieCount = 0;
+                        for (const cookie of browserFiles._cookies) {
+                            try {
+                                const params = {
+                                    name: cookie.name, value: cookie.value,
+                                    domain: cookie.domain, path: cookie.path,
+                                    secure: cookie.secure, httpOnly: cookie.httpOnly,
+                                    sameSite: cookie.sameSite || 'Lax',
+                                };
+                                if (cookie.expires > 0) params.expires = cookie.expires;
+                                await client.send('Network.setCookie', params);
+                                cookieCount++;
+                            } catch (ce) { }
+                        }
+                        console.log(`已导入 ${cookieCount}/${browserFiles._cookies.length} 个 Cookie (${profileId})`);
+                    }
+                    await browser.close();
+                    // 等待浏览器完全释放文件锁
+                    await new Promise(r => setTimeout(r, 1000));
+                } catch (err) {
+                    console.error(`CDP Cookie 导入失败 (${profileId}):`, err.message);
+                }
+            }
+
+            // 3. v2 格式: 密码写入 passwords.json (加密)
+            if (hasPasswords) {
+                try {
+                    const pwFile = path.join(DATA_PATH, profileId, 'passwords.json');
+                    await writeEncryptedPasswords(pwFile, browserFiles._passwords, profileId);
+                    console.log(`已恢复 ${browserFiles._passwords.length} 个密码到 passwords.json (${profileId})`);
+                } catch (err) {
+                    console.error(`密码恢复失败 (${profileId}):`, err.message);
                 }
             }
         }
@@ -1660,8 +2252,8 @@ async function launchProfileCore(sender, profileId, watermarkStyle) {
 
         // 1. 生成 GeekEZ Guard 扩展（使用传递的水印样式）
         const style = watermarkStyle || 'enhanced'; // 默认使用增强水印
-        const extPath = await generateExtension(profileDir, profile.fingerprint, profile.name, style);
         const injectScript = getInjectScript(profile.fingerprint, profile.name, style);
+        const extPath = await generateExtension(profileDir, profile.fingerprint, profile.name, style, profileId);
 
         // 2. 获取用户自定义扩展
         const userExts = settings.userExtensions || [];
@@ -1693,7 +2285,7 @@ async function launchProfileCore(sender, profileId, watermarkStyle) {
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-blink-features=AutomationControlled',
-            '--disable-features=IsolateOrigins,site-per-process',
+            '--disable-features=IsolateOrigins,site-per-process,ExtensionsMenuAccessControl',
             '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
             `--lang=${targetLang}`,
             `--accept-lang=${targetLang}`,
@@ -1702,6 +2294,7 @@ async function launchProfileCore(sender, profileId, watermarkStyle) {
             // 性能优化参数
             '--no-first-run',                    // 跳过首次运行向导
             '--no-default-browser-check',        // 跳过默认浏览器检查
+            '--disable-session-crashed-bubble',  // 隐藏恢复会话提示气泡
             '--disable-background-timer-throttling', // 防止后台标签页被限速
             '--disable-backgrounding-occluded-windows',
             '--disable-renderer-backgrounding',
@@ -1786,7 +2379,86 @@ async function launchProfileCore(sender, profileId, watermarkStyle) {
                 console.warn('[Inject] targetcreated failed:', e && e.message ? e.message : e);
             }
         });
+        // ==========================================
+        // Fix: Auto-close empty and extension tabs
+        // ==========================================
+        try {
+            // Extension background scripts might open tabs immediately upon load
+            // We use targetcreated to aggressively close them during the first 3 seconds
+            const startTime = Date.now();
+            const startupWindowMs = 3000;
 
+            // Allow chrome-extension:// and remote URLs (like onboarding.immersivetranslate.com)
+            // to be caught and closed if they open dynamically during startup.
+            const interceptor = async (target) => {
+                if (Date.now() - startTime > startupWindowMs) {
+                    browser.off('targetcreated', interceptor); // remove listener after 3s
+                    return;
+                }
+
+                if (target.type() === 'page') {
+                    try {
+                        const page = await target.page();
+                        if (page) {
+                            const url = page.url();
+                            // If it's an extension welcome page (either extension scheme or a remote onboarding URL)
+                            // Note: we can't reliably guess all remote URLs, but typically restore-session pages
+                            // were already created BEFORE targetcreated fires for new extension tabs, or they load silently.
+                            // Actually, Chrome session restore creates targets too.
+                            // To be safe, we mainly target the active welcome pages that usually steal focus.
+                            if (url.startsWith('chrome-extension://')) {
+                                await page.close();
+                            } else {
+                                // For remote URLs like immersive translate, extensions often use chrome.tabs.create
+                                // Wait for the URL to resolve and block the request so it doesn't flash
+                                try {
+                                    await page.setRequestInterception(true);
+                                    page.on('request', async (request) => {
+                                        if (Date.now() - startTime > startupWindowMs + 2000) {
+                                            try { await request.continue(); } catch (e) { }
+                                            return;
+                                        }
+                                        const reqUrl = request.url();
+                                        if (request.isNavigationRequest() && (reqUrl.includes('onboarding.') || reqUrl.includes('welcome') || reqUrl.includes('install') || reqUrl.startsWith('chrome-extension://'))) {
+                                            try { await request.abort(); } catch (e) { }
+                                            try { await page.close(); } catch (e) { }
+                                        } else {
+                                            try { await request.continue(); } catch (e) { }
+                                        }
+                                    });
+                                } catch (e) { }
+                            }
+                        }
+                    } catch (e) { }
+                }
+            };
+
+            browser.on('targetcreated', interceptor);
+
+            // Wait a moment for the initial session to restore
+            await new Promise(r => setTimeout(r, 1500));
+            const pages = await browser.pages();
+
+            let realTabCount = pages.filter(p => {
+                const url = p.url();
+                return url !== 'about:blank' && !url.startsWith('chrome-extension://') && !url.includes('onboarding.');
+            }).length;
+
+            for (const page of pages) {
+                try {
+                    const url = page.url();
+                    if (url.startsWith('chrome-extension://') || url.includes('onboarding.')) {
+                        await page.close();
+                        continue;
+                    }
+                    if (url === 'about:blank' && realTabCount > 0) {
+                        await page.close();
+                    }
+                } catch (e) { }
+            }
+        } catch (e) {
+            console.error('Failed to cleanup initial tabs:', e);
+        }
         activeProcesses[profileId] = {
             xrayPid: xrayProcess.pid,
             browser,
@@ -1794,9 +2466,30 @@ async function launchProfileCore(sender, profileId, watermarkStyle) {
         };
         if (sender && !sender.isDestroyed()) sender.send('profile-status', { id: profileId, status: 'running' });
 
-        // CDP Geolocation Removed in favor of Stealth JS Hook
-        // 由于 CDP 本身会被检测，我们移除所有 Emulation.Overrides
-        // 地理位置将由 fingerprint.js 中的 Stealth Hook 接管
+        // CDP Timezone Override (Windows only)
+        // On macOS/Linux, TZ env var changes V8's timezone natively.
+        // On Windows, V8 ignores TZ and uses Win32 API, so we use CDP instead.
+        // This changes V8's internal timezone at the engine level - all Date methods
+        // (toString, getTimezoneOffset, getHours, etc.) and Intl APIs work correctly.
+        const targetTimezone = profile.fingerprint?.timezone;
+        if (process.platform === 'win32' && targetTimezone && targetTimezone !== 'Auto') {
+            try {
+                const pages = await browser.pages();
+                for (const page of pages) {
+                    try { await page.emulateTimezone(targetTimezone); } catch (e) { }
+                }
+                browser.on('targetcreated', async (target) => {
+                    if (target.type() === 'page') {
+                        try {
+                            const page = await target.page();
+                            if (page) await page.emulateTimezone(targetTimezone);
+                        } catch (e) { }
+                    }
+                });
+            } catch (e) {
+                console.error('CDP timezone override failed:', e.message);
+            }
+        }
 
         browser.on('disconnected', async () => {
             if (activeProcesses[profileId]) {

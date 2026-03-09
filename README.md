@@ -118,7 +118,7 @@ npm run build:linux
 - ✅ **Pixelscan**: All tests passed
 - ✅ **Cloudflare**: Bot test passed
 
-## ❓ FAQ
+## ❓ FAQ 
 
 ### macOS: "App is damaged" or "Cannot be opened"
 
@@ -130,15 +130,13 @@ npm run build:linux
    ```
 3. Re-open the app.
 
+### <u>[***Click for More FAQ***](https://browser.geekez.net/docs#doc-faq)</u>
+
 ## ⚠️ Important Notes
 
 1. **Timezone Settings**: Use "Auto (No Change)" when logging into AWS, Oracle, or other sensitive websites to avoid white screen issues.
 2. **Geolocation**: Always select a city that matches your proxy IP location to avoid account bans.
 3. **Remote Debugging**: Only enable when you need external control via Puppeteer/DevTools. Keep it disabled for daily use.
-
-## 📝 License
-
-This project is licensed under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/).
 
 ## ⚠️ Disclaimer
 

@@ -159,7 +159,9 @@ function parseProxyLink(link, tag) {
                     try {
                         const decoded = decodeBase64Content(userPart);
                         if (decoded.includes(':')) {
-                            [method, password] = decoded.split(':');
+                            const colonIdx = decoded.indexOf(':');
+                            method = decoded.substring(0, colonIdx);
+                            password = decoded.substring(colonIdx + 1);
                         } else {
                             // Fallback or error
                             throw new Error("Invalid SS User Part");
@@ -169,7 +171,9 @@ function parseProxyLink(link, tag) {
                         throw e;
                     }
                 } else {
-                    [method, password] = userPart.split(':');
+                    const colonIdx = userPart.indexOf(':');
+                    method = userPart.substring(0, colonIdx);
+                    password = userPart.substring(colonIdx + 1);
                 }
 
                 // Host part might be ipv6 [::1]:port or ipv4:port
@@ -209,10 +213,60 @@ function parseProxyLink(link, tag) {
                     level: 1
                 }]
             };
-            // Shadowsocks streamSettings
+            // Shadowsocks streamSettings - check for obfuscation plugin
             outbound.streamSettings = {
                 network: "tcp"
             };
+
+            // Parse plugin/obfs parameters from SS URI
+            // Format: ss://...@host:port?plugin=obfs-local;obfs=http;obfs-host=xxx#remark
+            const fullLinkForParams = link.split('#')[0]; // Remove remark
+            if (fullLinkForParams.includes('?')) {
+                const queryStr = fullLinkForParams.split('?')[1];
+                const urlParams = new URLSearchParams(queryStr);
+                const plugin = urlParams.get('plugin');
+                if (plugin && plugin.includes('obfs')) {
+                    const pluginParts = plugin.split(';');
+                    let obfsType = '', obfsHost = '';
+                    pluginParts.forEach(p => {
+                        const kv = p.split('=');
+                        if (kv[0] === 'obfs') obfsType = kv[1];
+                        if (kv[0] === 'obfs-host') obfsHost = kv[1];
+                    });
+                    if (obfsType === 'http') {
+                        outbound.streamSettings = {
+                            network: "tcp",
+                            tcpSettings: {
+                                header: {
+                                    type: "http",
+                                    request: {
+                                        version: "1.1",
+                                        method: "GET",
+                                        path: ["/"],
+                                        headers: {
+                                            Host: obfsHost ? [obfsHost] : [],
+                                            "User-Agent": [],
+                                            "Accept-Encoding": ["gzip, deflate"],
+                                            Connection: ["keep-alive"],
+                                            Pragma: "no-cache"
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                    } else if (obfsType === 'tls') {
+                        outbound.streamSettings = {
+                            network: "tcp",
+                            security: "tls",
+                            tlsSettings: {
+                                serverName: obfsHost || host,
+                                allowInsecure: true
+                            }
+                        };
+                    }
+                }
+            }
+
             // Mux 配置
             outbound.mux = {
                 enabled: false,

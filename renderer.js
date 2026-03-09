@@ -233,7 +233,7 @@ function renderHelpContent() {
     const aboutHTML = curLang === 'en' ?
         `<div style="text-align:center;margin-bottom:24px;padding:20px 0;">
             <div style="font-size:28px;font-weight:700;color:var(--text-primary);letter-spacing:1px;">Geek<span style="color:var(--accent);">EZ</span></div>
-            <div style="font-size:12px;opacity:0.5;margin-top:4px;">v1.3.5 · Anti-detect Browser</div>
+            <div style="font-size:12px;opacity:0.5;margin-top:4px;">v1.4.0 · Anti-detect Browser</div>
          </div>
          
          <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">
@@ -296,7 +296,7 @@ function renderHelpContent() {
          </div>` :
         `<div style="text-align:center;margin-bottom:24px;padding:20px 0;">
             <div style="font-size:28px;font-weight:700;color:var(--text-primary);letter-spacing:1px;">Geek<span style="color:var(--accent);">EZ</span></div>
-            <div style="font-size:12px;opacity:0.5;margin-top:4px;">v1.3.5 · 指纹浏览器</div>
+            <div style="font-size:12px;opacity:0.5;margin-top:4px;">v1.4.0 · 指纹浏览器</div>
          </div>
          
          <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">
@@ -747,7 +747,6 @@ async function saveNewProfile() {
     // 将 "Auto (No Change)" 转换为 "Auto" 存储
     const timezone = timezoneInput === 'Auto (No Change)' ? 'Auto' : timezoneInput;
 
-    // Get city/location value
     const cityInput = document.getElementById('addCity').value;
     let city = null;
     let geolocation = null;
@@ -762,6 +761,17 @@ async function saveNewProfile() {
     // Get language value
     const languageInput = document.getElementById('addLanguage').value;
     const language = getLanguageCode(languageInput);
+
+    // Get pre-proxy value
+    const preProxyOverride = document.getElementById('addPreProxyOverride').value;
+
+    // Get screen resolution
+    const resW = parseInt(document.getElementById('addResW').value);
+    const resH = parseInt(document.getElementById('addResH').value);
+    let screen = null;
+    if (!isNaN(resW) && !isNaN(resH)) {
+        screen = { width: resW, height: resH };
+    }
 
     const tags = tagsStr.split(/[,，]/).map(s => s.trim()).filter(s => s);
 
@@ -790,7 +800,7 @@ async function saveNewProfile() {
         }
 
         try {
-            await window.electronAPI.saveProfile({ name, proxyStr, tags, timezone, city, geolocation, language });
+            await window.electronAPI.saveProfile({ name, proxyStr, tags, timezone, city, geolocation, language, screen, preProxyOverride });
             createdCount++;
         } catch (e) {
             console.error(`Failed to create profile ${name}:`, e);

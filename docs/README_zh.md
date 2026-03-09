@@ -115,7 +115,7 @@ npm run build:linux
 - ✅ **Pixelscan**: 全部通过
 - ✅ **Cloudflare**: 通过机器人检测
 
-## ❓ 常见问题 (FAQ)
+## ❓ 常见问题 (FAQ)  
 
 ### macOS 提示 "安装包已损坏" 或 "无法打开"
 
@@ -126,6 +126,8 @@ npm run build:linux
    sudo xattr -rd com.apple.quarantine /Applications/GeekEZ\ Browser.app
    ```
 3. 重新打开软件即可正常运行。
+
+### <u>[***点击查看更多FAQ***](https://browser.geekez.net/docs#doc-faq)</u>
 
 ## ⚠️ 免责声明
 

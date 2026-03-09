@@ -83,82 +83,10 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                 return func;
             };
 
-            // --- 0. Stealth Timezone Hook (Windows Only) ---
-            // On Windows, TZ env var doesn't work, so we use JS hooks
-            // On macOS/Linux, TZ env var works natively, no JS hook needed (avoids detection)
-            const isWindows = navigator.platform && navigator.platform.toLowerCase().includes('win');
-            if (isWindows && fp.timezone && fp.timezone !== 'Auto') {
-                // Helper to make functions appear native
-                const tzMakeNative = (func, name) => {
-                    const nativeStr = 'function ' + name + '() { [native code] }';
-                    func.toString = function() { return nativeStr; };
-                    func.toString.toString = function() { return 'function toString() { [native code] }'; };
-                    return func;
-                };
-
-                // Calculate timezone offset from timezone name
-                // This creates a date in the target timezone and compares to UTC
-                const getTimezoneOffsetForZone = (tz) => {
-                    try {
-                        const now = new Date();
-                        const utcDate = new Date(now.toLocaleString('en-US', { timeZone: 'UTC' }));
-                        const tzDate = new Date(now.toLocaleString('en-US', { timeZone: tz }));
-                        return Math.round((utcDate - tzDate) / 60000);
-                    } catch (e) {
-                        return new Date().getTimezoneOffset(); // Fallback to system
-                    }
-                };
-
-                const targetOffset = getTimezoneOffsetForZone(targetTimezone);
-
-                // Hook 1: Date.prototype.getTimezoneOffset
-                const origGetTimezoneOffset = Date.prototype.getTimezoneOffset;
-                Date.prototype.getTimezoneOffset = tzMakeNative(function getTimezoneOffset() {
-                    return targetOffset;
-                }, 'getTimezoneOffset');
-
-                // Hook 2: Intl.DateTimeFormat.prototype.resolvedOptions
-                const OrigDTFProto = Intl.DateTimeFormat.prototype;
-                const origResolvedOptions = OrigDTFProto.resolvedOptions;
-                OrigDTFProto.resolvedOptions = tzMakeNative(function resolvedOptions() {
-                    const result = origResolvedOptions.call(this);
-                    result.timeZone = targetTimezone;
-                    return result;
-                }, 'resolvedOptions');
-
-                // Hook 3: Date.prototype.toLocaleString family (with timeZone support)
-                const dateMethodsToHook = ['toLocaleString', 'toLocaleDateString', 'toLocaleTimeString'];
-                dateMethodsToHook.forEach(methodName => {
-                    const origMethod = Date.prototype[methodName];
-                    Date.prototype[methodName] = tzMakeNative(function(...args) {
-                        // If options provided without timeZone, inject target timeZone
-                        if (args.length === 0) {
-                            return origMethod.call(this, undefined, { timeZone: targetTimezone });
-                        } else if (args.length === 1) {
-                            return origMethod.call(this, args[0], { timeZone: targetTimezone });
-                        } else {
-                            const opts = args[1] || {};
-                            if (!opts.timeZone) {
-                                opts.timeZone = targetTimezone;
-                            }
-                            return origMethod.call(this, args[0], opts);
-                        }
-                    }, methodName);
-                });
-
-                // Hook 4: new Intl.DateTimeFormat() constructor - inject default timeZone
-                const OrigDateTimeFormat = Intl.DateTimeFormat;
-                Intl.DateTimeFormat = function(locales, options) {
-                    const opts = options ? { ...options } : {};
-                    if (!opts.timeZone) {
-                        opts.timeZone = targetTimezone;
-                    }
-                    return new OrigDateTimeFormat(locales, opts);
-                };
-                Intl.DateTimeFormat.prototype = OrigDateTimeFormat.prototype;
-                Intl.DateTimeFormat.supportedLocalesOf = OrigDateTimeFormat.supportedLocalesOf.bind(OrigDateTimeFormat);
-                tzMakeNative(Intl.DateTimeFormat, 'DateTimeFormat');
-            }
+            // --- Timezone ---
+            // On macOS/Linux: TZ env var handles timezone at C runtime level
+            // On Windows: CDP Emulation.setTimezoneOverride handles it at V8 level
+            // No JS hooks needed on any platform (avoids detection)
 
             // --- 1. 移除 WebDriver 及 Puppeteer 特征 ---
             if (navigator.webdriver) {
