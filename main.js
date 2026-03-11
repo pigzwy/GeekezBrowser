@@ -515,10 +515,19 @@ function forceKill(pid) {
 }
 
 function getChromiumPath() {
-    const basePath = isDev ? path.join(__dirname, 'resources', 'puppeteer') : path.join(process.resourcesPath, 'puppeteer');
-
+    // 优先级 1：环境变量指定的路径
     const envPath = process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROME_PATH;
     if (envPath && fs.existsSync(envPath)) return envPath;
+
+    // 优先级 2：系统安装的正版 Chrome（推荐！避免 Chrome for Testing 被检测）
+    const systemChrome = findSystemChrome();
+    if (systemChrome) {
+        console.log('[Chrome] Using system Chrome:', systemChrome);
+        return systemChrome;
+    }
+
+    // 优先级 3：Puppeteer 自带的 Chrome for Testing（降级方案）
+    const basePath = isDev ? path.join(__dirname, 'resources', 'puppeteer') : path.join(process.resourcesPath, 'puppeteer');
 
     if (!fs.existsSync(basePath)) return null;
     function findFile(dir, filename) {
@@ -551,6 +560,42 @@ function getChromiumPath() {
     }
 
     return findFile(basePath, 'chrome');
+}
+
+/**
+ * 查找系统安装的正版 Chrome
+ * 正版 Chrome 不会被 Stripe/Cloudflare 标记为 "Chrome for Testing"
+ */
+function findSystemChrome() {
+    if (process.platform === 'win32') {
+        const candidates = [
+            path.join(process.env.PROGRAMFILES || 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+            path.join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+            path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        ];
+        for (const p of candidates) {
+            if (p && fs.existsSync(p)) return p;
+        }
+    } else if (process.platform === 'darwin') {
+        const candidates = [
+            '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+            path.join(os.homedir(), 'Applications', 'Google Chrome.app', 'Contents', 'MacOS', 'Google Chrome'),
+        ];
+        for (const p of candidates) {
+            if (fs.existsSync(p)) return p;
+        }
+    } else {
+        const candidates = [
+            '/usr/bin/google-chrome',
+            '/usr/bin/google-chrome-stable',
+            '/usr/bin/chromium-browser',
+            '/usr/bin/chromium',
+        ];
+        for (const p of candidates) {
+            if (fs.existsSync(p)) return p;
+        }
+    }
+    return null;
 }
 
 let controlServer = null;
@@ -2251,8 +2296,9 @@ async function launchProfileCore(sender, profileId, watermarkStyle) {
         profile.fingerprint.languages = [targetLang, targetLang.split('-')[0]];
 
         // 1. 生成 GeekEZ Guard 扩展（使用传递的水印样式）
+        // 注：指纹注入完全由扩展 content script 负责（world: MAIN, run_at: document_start）
+        // 不再通过 CDP evaluateOnNewDocument 注入，避免留下可检测的 CDP 绑定
         const style = watermarkStyle || 'enhanced'; // 默认使用增强水印
-        const injectScript = getInjectScript(profile.fingerprint, profile.name, style);
         const extPath = await generateExtension(profileDir, profile.fingerprint, profile.name, style, profileId);
 
         // 2. 获取用户自定义扩展
@@ -2276,32 +2322,46 @@ async function launchProfileCore(sender, profileId, watermarkStyle) {
 
         // 4. 构建启动参数（性能优化）
 
+        // ====================================================================
+        // 启动参数 — 尽可能模拟真实用户的 Chrome 启动方式
+        // 已移除的自动化指标:
+        //   --no-sandbox              → Windows 不需要，CI/Docker 才用
+        //   --disable-dev-shm-usage   → Docker/CI 专用
+        //   --disable-features=IsolateOrigins,site-per-process → 安全降级
+        //   --disable-background-timer-throttling → 正常浏览器不会加
+        //   --class=GeekezBrowser-xxx → 直接暴露身份
+        //   --disk-cache-size / --media-cache-size → 非标准配置
+        // ====================================================================
         const launchArgs = [
+            // === 核心功能（必需）===
             `--proxy-server=socks5://127.0.0.1:${localPort}`,
             `--user-data-dir=${userDataDir}`,
             `--window-size=${profile.fingerprint?.window?.width || 1280},${profile.fingerprint?.window?.height || 800}`,
-            `--class=GeekezBrowser-${profile.id.slice(0, 8)}`,
             '--restore-last-session',
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-blink-features=AutomationControlled',
-            '--disable-features=IsolateOrigins,site-per-process,ExtensionsMenuAccessControl',
             '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+
+            // === 反自动化检测（关键）===
+            '--disable-blink-features=AutomationControlled',
+
+            // === 语言 ===
             `--lang=${targetLang}`,
             `--accept-lang=${targetLang}`,
+
+            // === 扩展加载 ===
             `--disable-extensions-except=${extPaths}`,
             `--load-extension=${extPaths}`,
-            // 性能优化参数
-            '--no-first-run',                    // 跳过首次运行向导
-            '--no-default-browser-check',        // 跳过默认浏览器检查
-            '--disable-session-crashed-bubble',  // 隐藏恢复会话提示气泡
-            '--disable-background-timer-throttling', // 防止后台标签页被限速
-            '--disable-backgrounding-occluded-windows',
-            '--disable-renderer-backgrounding',
-            '--disable-dev-shm-usage',           // 减少共享内存使用
-            '--disk-cache-size=52428800',        // 限制磁盘缓存为 50MB
-            '--media-cache-size=52428800'        // 限制媒体缓存为 50MB
+
+            // === 普通用户也会有的参数 ===
+            '--no-first-run',
+            '--no-default-browser-check',
+            '--disable-session-crashed-bubble',
         ];
+
+        // Linux 专用沙箱参数（Windows/macOS 不需要）
+        if (process.platform === 'linux') {
+            launchArgs.push('--no-sandbox');
+            launchArgs.push('--disable-setuid-sandbox');
+        }
 
         // 5. Remote Debugging Port (if enabled)
         if (settings.enableRemoteDebugging && profile.debugPort) {
@@ -2352,31 +2412,89 @@ async function launchProfileCore(sender, profileId, watermarkStyle) {
             env: env  // 注入环境变量
         });
 
-        const addInitScript = async (page) => {
+        // ====================================================================
+        // 指纹注入完全由 Chrome Extension content_scripts 负责
+        // （world: MAIN, all_frames: true, run_at: document_start）
+        //
+        // 注意：不调用 setBypassCSP（会被 Stripe/CF 检测）
+        // 注意：不通过 CDP 注入指纹 hook（会留下可检测的绑定）
+        //
+        // 但水印需要通过 CDP evaluateOnNewDocument 注入，因为：
+        //  - 扩展 content_scripts 不能在 chrome:// 等内部页面执行
+        //  - 某些页面的 CSP 可能阻止 MAIN world 的 DOM 操作
+        //  - 水印只是 DOM 创建，不涉及 API hook，不会被 Stripe 检测
+        // ====================================================================
+        const safeProfileName = (profile.name || 'Profile').replace(/[<>"'&]/g, '');
+        const watermarkOnlyScript = `
+        (function() {
+            if (window.__geekez_wm) return;
+            window.__geekez_wm = true;
             try {
-                if (page && typeof page.setBypassCSP === 'function') {
-                    await page.setBypassCSP(true);
+                const watermarkStyle = '${style}';
+                function createWatermark() {
+                    try {
+                        if (document.getElementById('geekez-watermark')) return;
+                        if (!document.body) { setTimeout(createWatermark, 50); return; }
+                        if (watermarkStyle === 'banner') {
+                            const banner = document.createElement('div');
+                            banner.id = 'geekez-watermark';
+                            banner.style.cssText = 'position: fixed; top: 0; left: 0; right: 0; background: linear-gradient(135deg, rgba(102, 126, 234, 0.5), rgba(118, 75, 162, 0.5)); backdrop-filter: blur(10px); color: white; padding: 5px 20px; text-align: center; font-size: 12px; font-weight: 500; z-index: 2147483647; box-shadow: 0 2px 10px rgba(0,0,0,0.1); display: flex; align-items: center; justify-content: center; gap: 8px; font-family: monospace;';
+                            const icon = document.createElement('span'); icon.textContent = '🔹'; icon.style.cssText = 'font-size: 14px;';
+                            const text = document.createElement('span'); text.textContent = '环境：${safeProfileName}';
+                            const closeBtn = document.createElement('button');
+                            closeBtn.textContent = '×';
+                            closeBtn.style.cssText = 'position: absolute; right: 10px; background: rgba(255,255,255,0.2); border: none; color: white; width: 20px; height: 20px; border-radius: 50%; cursor: pointer; font-size: 16px; line-height: 1; transition: background 0.2s; font-family: monospace;';
+                            closeBtn.onmouseover = function() { this.style.background = 'rgba(255,255,255,0.3)'; };
+                            closeBtn.onmouseout = function() { this.style.background = 'rgba(255,255,255,0.2)'; };
+                            closeBtn.onclick = function() { banner.style.display = 'none'; };
+                            banner.appendChild(icon); banner.appendChild(text); banner.appendChild(closeBtn);
+                            document.body.appendChild(banner);
+                        } else {
+                            const watermark = document.createElement('div');
+                            watermark.id = 'geekez-watermark';
+                            watermark.style.cssText = 'position: fixed; bottom: 16px; right: 16px; background: linear-gradient(135deg, rgba(102, 126, 234, 0.5), rgba(118, 75, 162, 0.5)); backdrop-filter: blur(10px); color: white; padding: 10px 16px; border-radius: 8px; font-size: 15px; font-weight: 600; z-index: 2147483647; pointer-events: none; user-select: none; box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4); display: flex; align-items: center; gap: 8px; font-family: monospace; animation: geekez-pulse 2s ease-in-out infinite;';
+                            const icon = document.createElement('span'); icon.textContent = '🎯'; icon.style.cssText = 'font-size: 18px; animation: geekez-rotate 3s linear infinite;';
+                            const text = document.createElement('span'); text.textContent = '${safeProfileName}';
+                            watermark.appendChild(icon); watermark.appendChild(text);
+                            document.body.appendChild(watermark);
+                            if (!document.getElementById('geekez-watermark-styles')) {
+                                const s = document.createElement('style'); s.id = 'geekez-watermark-styles';
+                                s.textContent = '@keyframes geekez-pulse { 0%, 100% { box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4); } 50% { box-shadow: 0 4px 25px rgba(102, 126, 234, 0.6); } } @keyframes geekez-rotate { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }';
+                                document.head.appendChild(s);
+                            }
+                        }
+                    } catch(e) { console.warn('Watermark init failed:', e && e.message ? e.message : e); }
                 }
-                await page.evaluateOnNewDocument(injectScript);
+                if (document.readyState === 'loading') {
+                    document.addEventListener('DOMContentLoaded', createWatermark);
+                } else { createWatermark(); }
+            } catch(e) { console.error('Watermark Error', e); }
+        })();
+        `;
+
+        // 通过 CDP 注入水印脚本（不含指纹 hook，不调 setBypassCSP）
+        const addWatermarkScript = async (page) => {
+            try {
+                await page.evaluateOnNewDocument(watermarkOnlyScript);
             } catch (e) {
-                console.warn('[Inject] evaluateOnNewDocument failed:', e && e.message ? e.message : e);
+                console.warn('[Watermark] evaluateOnNewDocument failed:', e && e.message ? e.message : e);
             }
         };
 
         try {
             const pages = await browser.pages();
-            await Promise.all(pages.map(addInitScript));
+            await Promise.all(pages.map(addWatermarkScript));
         } catch (e) {
-            console.warn('[Inject] init pages failed:', e && e.message ? e.message : e);
+            console.warn('[Watermark] init pages failed:', e && e.message ? e.message : e);
         }
 
         browser.on('targetcreated', async (target) => {
             if (target.type() !== 'page') return;
             try {
                 const page = await target.page();
-                if (page) await addInitScript(page);
+                if (page) await addWatermarkScript(page);
             } catch (e) {
-                console.warn('[Inject] targetcreated failed:', e && e.message ? e.message : e);
+                console.warn('[Watermark] targetcreated failed:', e && e.message ? e.message : e);
             }
         });
         // ==========================================
