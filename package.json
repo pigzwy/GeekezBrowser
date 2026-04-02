@@ -61,7 +61,7 @@
           ]
         }
       ],
-      "icon": "resources/icon.ico",
+      "icon": "resources/logo.ico",
       "artifactName": "${productName}-${version}-${os}-${arch}.${ext}"
     },
     "nsis": {
