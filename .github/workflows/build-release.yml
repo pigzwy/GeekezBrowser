@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 env:
-  XRAY_FALLBACK_VERSION: 'v26.2.6'
+  XRAY_FALLBACK_VERSION: 'v26.3.27'
 
 jobs:
   build:
@@ -35,13 +35,13 @@ jobs:
             os: win32
             arch: x64
             xray_asset: Xray-windows-64.zip
-            build_cmd: npx electron-builder --win nsis zip --x64
+            build_cmd: npm run build && npx electron-builder --win nsis zip --x64
           # Windows ARM64
           - platform: windows-latest
             os: win32
             arch: arm64
             xray_asset: Xray-windows-arm64-v8a.zip
-            build_cmd: npx electron-builder --win nsis zip --arm64
+            build_cmd: npm run build && npx electron-builder --win nsis zip --arm64
           # Linux x64
           - platform: ubuntu-latest
             os: linux
@@ -53,7 +53,7 @@ jobs:
             os: linux
             arch: arm64
             xray_asset: Xray-linux-arm64-v8a.zip
-            build_cmd: npx electron-builder --linux --arm64
+            build_cmd: npm run build && npx electron-builder --linux --arm64
 
     runs-on: ${{ matrix.platform }}
     
@@ -88,7 +88,7 @@ jobs:
           [ "${{ matrix.os }}" != "win32" ] && chmod +x "$BIN_DIR/xray" || true
 
       - name: Download Chrome
-        run: npx @puppeteer/browsers install chrome@143.0.7499.169 --path resources/puppeteer
+        run: npx @puppeteer/browsers install chrome@147.0.7727.50 --path resources/puppeteer
 
       - name: Build
         run: ${{ matrix.build_cmd }}

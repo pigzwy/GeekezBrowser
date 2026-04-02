@@ -2,7 +2,7 @@
 
 <div align="center">
 
-<img src="../icon.png" width="100" height="100" alt="GeekEZ Logo">
+<img src="../src/renderer/icon.png" width="100" height="100" alt="GeekEZ Logo">
 
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
@@ -17,9 +17,9 @@
 
 ## 📖 简介
 
-**GeekEZ Browser** 是一款基于 **Electron** 和 **Puppeteer** 构建的指纹浏览器，底层深度集成 **Xray-core**。
+**GeekEZ Browser** 是一款集成支持Xray代理的指纹浏览器。
 
-它致力于解决跨境电商（TikTok, Amazon, Facebook, Shopee, etc.）的多账号防关联问题。通过深度伪装，完美通过 Cloudflare，Pixelscan 和 BrowserScan 的高强度检测。
+致力于解决跨境电商（TikTok, Amazon, Facebook, Shopee, etc.）多账号关联的问题。通过深度伪装，完美通过 Cloudflare，Pixelscan 和 BrowserScan 的高强度检测。
 
 ## 📸 软件截图
 
@@ -41,6 +41,7 @@
     - 支持 **60+ 种语言**，覆盖全球主要地区。
     - 全面修改浏览器语言、HTTP 请求头和国际化 API。
 *   **WebRTC 物理阻断**: 强制使用 `disable_non_proxied_udp` 策略，物理切断本地 IP 泄露路径。
+*   **UA与WebGL修改**: 支持修改浏览器版本以及WebGL。*（注：暂无法绕过检测）*
 
 ### 🔗 全能网络引擎 (Xray-core)
 *   **全协议支持**: 完美支持 VMess, VLESS, Trojan, Shadowsocks (含 **SS-2022**), Socks5, HTTP。
@@ -49,7 +50,7 @@
 *   **双栈支持**: 智能路由策略，完美支持 IPv4/IPv6 双栈节点。
 
 ### 🧩 工作流与管理
-*   **插件支持**: 支持导入解压后的 Chrome 扩展（如 MetaMask, AdBlock），并自动应用到所有环境。
+*   **插件支持**: 支持安装 Chrome 扩展（如 MetaMask, AdBlock），并自定义配置使用环境。
 *   **标签系统**: 为环境添加彩色标签（如 "TikTok", "美国", "主号"），便于分组管理。
 *   **安全备注**: 使用 **动态水印** 在页面上方显示环境名称（如 `Profile-1`）。
 *   **稳定多开**: 支持同时运行多个环境，端口和进程完全独立互不干扰。
@@ -81,7 +82,7 @@
 
 3.  **启动软件**
     ```bash
-    npm start
+    npm run dev
     ```
 
 ## 🛠 平台适用性指南
@@ -127,7 +128,7 @@ npm run build:linux
    ```
 3. 重新打开软件即可正常运行。
 
-### <u>[***点击查看更多FAQ***](https://browser.geekez.net/docs#doc-faq)</u>
+### <u>[***点击查看更多详细说明***](https://browser.geekez.net/doc.html#doc-usage)</u>
 
 ## ⚠️ 免责声明
 
@@ -139,3 +140,14 @@ npm run build:linux
 
 ## 💬 交流群
 [*QQ群：1079216892*](tencent://groupwpa/?subcmd=all&uin=1079216892)
+
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=EchoHS%2FGeekezBrowser&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=EchoHS/GeekezBrowser&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=EchoHS/GeekezBrowser&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=EchoHS/GeekezBrowser&type=date&legend=top-left" />
+ </picture>
+</a>

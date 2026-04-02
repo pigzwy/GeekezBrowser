@@ -11,5 +11,6 @@ resources/bin/
 resources/puppeteer/
 website/
 tools/
+out/
 *.log
 *.exe

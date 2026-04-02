@@ -205,8 +205,8 @@ async function main() {
             xrayVersion = await getLatestXrayVersion(!isGlobal);
             console.log(`📦 Latest version: ${xrayVersion}`);
         } catch (e) {
-            console.log('⚠️  Failed to get latest version, using fallback: v26.2.6');
-            xrayVersion = 'v26.2.6';
+            console.log('⚠️  Failed to get latest version, using fallback: v26.3.27');
+            xrayVersion = 'v26.3.27';
         }
 
         const baseUrl = `https://github.com/XTLS/Xray-core/releases/download/${xrayVersion}/${xrayAsset}`;
@@ -241,7 +241,7 @@ async function main() {
         // 2. 准备 Chrome
         process.stdout.write('⬇️  Downloading Chrome...\n');
         const { install } = require('@puppeteer/browsers');
-        const BUILD_ID = '143.0.7499.169';
+        const BUILD_ID = '147.0.7727.50';
         const DOWNLOAD_ROOT = path.join(__dirname, 'resources', 'puppeteer');
         const MIRROR_URL = 'https://npmmirror.com/mirrors/chrome-for-testing';
 

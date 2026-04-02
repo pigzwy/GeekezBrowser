@@ -3,7 +3,9 @@ const { URL } = require('url');
 
 function decodeBase64Content(str) {
     try {
+        if (!str) return '';
         str = str.replace(/-/g, '+').replace(/_/g, '/');
+        while (str.length % 4 !== 0) str += '=';
         return Buffer.from(str, 'base64').toString('utf8');
     } catch (e) { return str; }
 }
@@ -26,12 +28,7 @@ function getProxyRemark(link) {
 
 function parseProxyLink(link, tag) {
     let outbound = {
-        tag: tag,
-        sniffing: {
-            enabled: true,
-            destOverride: ["http", "tls", "quic"],
-            routeOnly: true
-        }
+        tag: tag
     };
     link = link.trim();
 
@@ -177,9 +174,18 @@ function parseProxyLink(link, tag) {
                 }
 
                 // Host part might be ipv6 [::1]:port or ipv4:port
-                const lastColonIndex = hostPart.lastIndexOf(':');
-                host = hostPart.substring(0, lastColonIndex);
-                port = hostPart.substring(lastColonIndex + 1);
+                let lastColonIndex = hostPart.lastIndexOf(':');
+                if (lastColonIndex === -1) {
+                    host = hostPart;
+                    port = "8388";
+                } else {
+                    host = hostPart.substring(0, lastColonIndex);
+                    port = hostPart.substring(lastColonIndex + 1);
+                }
+                
+                // Remove potential query/fragment from port
+                if (port.includes('?')) port = port.split('?')[0];
+                if (port.includes('/')) port = port.split('/')[0];
 
                 // Remove brackets from IPv6
                 if (host.startsWith('[') && host.endsWith(']')) {
@@ -203,6 +209,8 @@ function parseProxyLink(link, tag) {
             }
 
             outbound.protocol = "shadowsocks";
+            
+            // Minimalist settings matching v2rayN format
             outbound.settings = {
                 servers: [{
                     address: host,
@@ -213,17 +221,22 @@ function parseProxyLink(link, tag) {
                     level: 1
                 }]
             };
-            // Shadowsocks streamSettings - check for obfuscation plugin
+
+            // Minimalist streamSettings
             outbound.streamSettings = {
                 network: "tcp"
             };
 
-            // Parse plugin/obfs parameters from SS URI
-            // Format: ss://...@host:port?plugin=obfs-local;obfs=http;obfs-host=xxx#remark
-            const fullLinkForParams = link.split('#')[0]; // Remove remark
+            const fullLinkForParams = link.split('#')[0];
             if (fullLinkForParams.includes('?')) {
                 const queryStr = fullLinkForParams.split('?')[1];
                 const urlParams = new URLSearchParams(queryStr);
+                
+                // Only add uot if explicitly requested (match v2rayN export which lacks it)
+                if (urlParams.get('uot') === '1' || urlParams.get('uot') === 'true') {
+                    outbound.settings.servers[0].uot = true;
+                }
+
                 const plugin = urlParams.get('plugin');
                 if (plugin && plugin.includes('obfs')) {
                     const pluginParts = plugin.split(';');
@@ -298,33 +311,41 @@ function parseProxyLink(link, tag) {
                 const authPart = cleanLink.substring(0, atIndex);
                 serverPart = cleanLink.substring(atIndex + 1);
 
-                // Try to decode as base64 first (v2rayN style)
-                try {
-                    const decoded = Buffer.from(authPart, 'base64').toString('utf8');
-                    const colonIndex = decoded.indexOf(':');
-                    if (colonIndex !== -1) {
-                        username = decoded.substring(0, colonIndex);
-                        password = decoded.substring(colonIndex + 1);
-                    } else {
-                        // Not a valid user:pass format after decode, treat as plain username
-                        username = authPart;
-                    }
-                } catch (e) {
-                    // Not base64, check if it's user:pass format
-                    const colonIndex = authPart.indexOf(':');
-                    if (colonIndex !== -1) {
-                        username = authPart.substring(0, colonIndex);
-                        password = authPart.substring(colonIndex + 1);
+                // Standard auth: socks://user:pass@host:port
+                const plainColonIndex = authPart.indexOf(':');
+                if (plainColonIndex !== -1) {
+                    username = authPart.substring(0, plainColonIndex);
+                    password = authPart.substring(plainColonIndex + 1);
+                } else {
+                    // v2rayN auth: socks://base64(user:pass)@host:port
+                    const looksBase64 = /^[A-Za-z0-9+/=_-]+$/.test(authPart);
+                    if (looksBase64) {
+                        const decoded = decodeBase64Content(authPart);
+                        const decodedColonIndex = decoded.indexOf(':');
+                        if (decodedColonIndex !== -1) {
+                            username = decoded.substring(0, decodedColonIndex);
+                            password = decoded.substring(decodedColonIndex + 1);
+                        } else {
+                            username = authPart;
+                        }
                     } else {
                         username = authPart;
                     }
                 }
             }
 
-            // Parse server part (host:port)
-            const colonIndex = serverPart.indexOf(':');
-            const address = colonIndex !== -1 ? serverPart.substring(0, colonIndex) : serverPart;
-            const port = colonIndex !== -1 ? parseInt(serverPart.substring(colonIndex + 1)) : 1080;
+            // Parse server part (host:port), keep IPv6 compatibility.
+            let address = serverPart;
+            let port = 1080;
+            try {
+                const serverUrl = new URL(`socks://${serverPart}`);
+                address = serverUrl.hostname;
+                port = serverUrl.port ? parseInt(serverUrl.port) : 1080;
+            } catch (e) {
+                const colonIndex = serverPart.lastIndexOf(':');
+                address = colonIndex !== -1 ? serverPart.substring(0, colonIndex) : serverPart;
+                port = colonIndex !== -1 ? parseInt(serverPart.substring(colonIndex + 1)) : 1080;
+            }
 
             outbound.settings = {
                 servers: [{
@@ -367,16 +388,50 @@ function parseProxyLink(link, tag) {
     return outbound;
 }
 
-function generateXrayConfig(mainProxyStr, localPort, preProxyConfig = null) {
+function deriveUtlsFingerprint(profileFingerprint = {}) {
+    if (profileFingerprint.uaMode === 'none') return '';
+
+    const browserType = String(profileFingerprint.browserType || '').toLowerCase();
+    const major = Number(profileFingerprint.browserMajorVersion) || 0;
+
+    if (browserType === 'edge') {
+        if (major >= 132) return 'edge';
+        if (major >= 126) return 'chrome';
+        return 'randomized';
+    }
+
+    if (major >= 134) return 'chrome';
+    if (major >= 128) return 'randomized';
+    if (major >= 123) return 'hellorandomizednoalpn';
+    return 'chrome';
+}
+
+function applyUtlsFingerprint(outbound, utlsFingerprint) {
+    if (!outbound || !utlsFingerprint || !outbound.streamSettings) return;
+
+    const stream = outbound.streamSettings;
+    if (stream.security === 'tls') {
+        if (!stream.tlsSettings) stream.tlsSettings = {};
+        stream.tlsSettings.fingerprint = utlsFingerprint;
+    }
+
+    if (stream.security === 'reality') {
+        if (!stream.realitySettings) stream.realitySettings = {};
+        stream.realitySettings.fingerprint = utlsFingerprint;
+    }
+}
+
+function generateXrayConfig(mainProxyStr, localPort, preProxyConfig = null, profileFingerprint = null) {
     const outbounds = [];
-    let mainOutbound;
-    try { mainOutbound = parseProxyLink(mainProxyStr, "proxy_main"); }
-    catch (e) { mainOutbound = { protocol: "freedom", tag: "proxy_main" }; }
+    const utlsFingerprint = deriveUtlsFingerprint(profileFingerprint || {});
+    const mainOutbound = parseProxyLink(mainProxyStr, "proxy_main");
+    applyUtlsFingerprint(mainOutbound, utlsFingerprint);
 
     if (preProxyConfig && preProxyConfig.preProxies && preProxyConfig.preProxies.length > 0) {
         try {
             const target = preProxyConfig.preProxies[0];
             const preOutbound = parseProxyLink(target.url, "proxy_pre");
+            applyUtlsFingerprint(preOutbound, utlsFingerprint);
             outbounds.push(preOutbound);
             mainOutbound.proxySettings = { tag: "proxy_pre" };
         } catch (e) { }
@@ -387,13 +442,23 @@ function generateXrayConfig(mainProxyStr, localPort, preProxyConfig = null) {
 
     return {
         log: { loglevel: "warning" },
-        inbounds: [{ port: localPort, listen: "127.0.0.1", protocol: "socks", settings: { udp: true } }],
+        inbounds: [{ 
+            port: localPort, 
+            listen: "127.0.0.1", 
+            protocol: "socks", 
+            settings: { udp: true },
+            sniffing: {
+                enabled: true,
+                destOverride: ["http", "tls", "quic"],
+                routeOnly: false
+            }
+        }],
         outbounds: outbounds,
         routing: {
-            domainStrategy: "IPIfNonMatch",
+            domainStrategy: "AsIs",
             rules: [{ type: "field", outboundTag: "proxy_main", port: "0-65535" }]
         }
     };
 }
 
-module.exports = { generateXrayConfig, parseProxyLink, getProxyRemark };
+export { generateXrayConfig, parseProxyLink, getProxyRemark };
