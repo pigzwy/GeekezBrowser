@@ -383,6 +383,15 @@ function parseProxyLink(link, tag) {
             const urlObj = new URL(link);
             outbound.protocol = "http";
             outbound.settings = { servers: [{ address: urlObj.hostname, port: parseInt(urlObj.port), users: urlObj.username ? [{ user: urlObj.username, pass: urlObj.password }] : [] }] };
+            // HTTPS 代理：需要 TLS 连接到代理服务器本身
+            if (link.startsWith('https://')) {
+                outbound.streamSettings = {
+                    security: "tls",
+                    tlsSettings: {
+                        allowInsecure: true
+                    }
+                };
+            }
         } else { throw new Error("Unsupported protocol"); }
     } catch (e) { console.error("Parse Proxy Error:", link, e); throw e; }
     return outbound;
