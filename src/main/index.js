@@ -1540,7 +1540,55 @@ function forceKill(pid) {
     });
 }
 
+/**
+ * 查找系统安装的正版 Chrome
+ * 正版 Chrome 不会被 Stripe/Cloudflare 标记为 "Chrome for Testing"
+ */
+function findSystemChrome() {
+    if (process.platform === 'win32') {
+        const candidates = [
+            path.join(process.env.PROGRAMFILES || 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+            path.join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+            path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        ];
+        for (const p of candidates) {
+            if (p && fs.existsSync(p)) return p;
+        }
+    } else if (process.platform === 'darwin') {
+        const candidates = [
+            '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+            path.join(os.homedir(), 'Applications', 'Google Chrome.app', 'Contents', 'MacOS', 'Google Chrome'),
+        ];
+        for (const p of candidates) {
+            if (fs.existsSync(p)) return p;
+        }
+    } else {
+        const candidates = [
+            '/usr/bin/google-chrome',
+            '/usr/bin/google-chrome-stable',
+            '/usr/bin/chromium-browser',
+            '/usr/bin/chromium',
+        ];
+        for (const p of candidates) {
+            if (fs.existsSync(p)) return p;
+        }
+    }
+    return null;
+}
+
 function getChromiumPath() {
+    // 优先级 1：环境变量指定的路径
+    const envPath = process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROME_PATH;
+    if (envPath && fs.existsSync(envPath)) return envPath;
+
+    // 优先级 2：系统安装的正版 Chrome（避免 Chrome for Testing 被检测）
+    const systemChrome = findSystemChrome();
+    if (systemChrome) {
+        console.log('[Chrome] Using system Chrome:', systemChrome);
+        return systemChrome;
+    }
+
+    // 优先级 3：Puppeteer 自带的 Chrome for Testing（降级方案）
     const basePath = isDev ? path.join(app.getAppPath(), 'resources', 'puppeteer') : path.join(process.resourcesPath, 'puppeteer');
     if (!fs.existsSync(basePath)) return null;
     function findFile(dir, filename) {
@@ -1549,18 +1597,26 @@ function getChromiumPath() {
             for (const file of files) {
                 const fullPath = path.join(dir, file);
                 const stat = fs.statSync(fullPath);
-                if (stat.isDirectory()) { const res = findFile(fullPath, filename); if (res) return res; }
-                else if (file === filename) return fullPath;
+                if (stat.isDirectory()) {
+                    const res = findFile(fullPath, filename);
+                    if (res) return res;
+                } else if (file === filename) {
+                    return fullPath;
+                }
             }
-        } catch (e) { return null; } return null;
+        } catch (e) {
+            return null;
+        }
+        return null;
     }
 
-    // macOS: Chrome binary is inside .app/Contents/MacOS/
     if (process.platform === 'darwin') {
         return findFile(basePath, 'Google Chrome for Testing');
     }
-    // Windows
-    return findFile(basePath, 'chrome.exe');
+    if (process.platform === 'win32') {
+        return findFile(basePath, 'chrome.exe');
+    }
+    return findFile(basePath, 'chrome');
 }
 
 // Settings management
