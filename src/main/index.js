@@ -1746,7 +1746,15 @@ async function stopRunningProfile(profileId, options = {}) {
     if (!proc) return false;
 
     await forceKill(proc.xrayPid);
-    try { await proc.browser.close(); } catch (e) { }
+    try {
+        if (proc.browser && typeof proc.browser.close === 'function') {
+            await proc.browser.close();
+        } else if (proc.chromePid) {
+            await forceKill(proc.chromePid);
+        }
+    } catch (e) {
+        console.warn('Failed to close browser for profile:', profileId, e && e.message ? e.message : e);
+    }
     if (proc.logFd !== undefined) {
         try { fs.closeSync(proc.logFd); } catch (e) { }
     }
@@ -1756,6 +1764,7 @@ async function stopRunningProfile(profileId, options = {}) {
     if (refreshMenu) {
         refreshTrayMenu().catch(() => { });
     }
+    await new Promise(r => setTimeout(r, 200));
     return true;
 }
 
