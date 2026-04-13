@@ -775,6 +775,23 @@ function getInjectScript(fp, profileName, watermarkStyle) {
 
     return `
     (function() {
+        // 防止重复注入
+        const _injKey = Symbol.for('__fp_guard__');
+        if (window[_injKey]) return;
+        Object.defineProperty(window, _injKey, { value: true, enumerable: false, configurable: false });
+
+        // 支付域完全跳过注入，避免触发风控
+        const host = (location && location.hostname ? location.hostname : '').toLowerCase();
+        const paymentDomains = [
+            'stripe.com',
+            'paypal.com',
+            'braintreegateway.com',
+            'braintree-api.com',
+            'adyen.com',
+            'cardinalcommerce.com'
+        ];
+        if (paymentDomains.some(domain => host === domain || host.endsWith('.' + domain))) return;
+
         try {
             const fp = ${fpJson};
 
@@ -806,18 +823,60 @@ function getInjectScript(fp, profileName, watermarkStyle) {
 
             // --- 1. Basic automation markers cleanup ---
             try {
-                defineValueGetter(Navigator.prototype, 'webdriver', false, 'get webdriver');
+                // webdriver 三重覆盖策略
+                const wdGetter = makeNative(function() { return false; }, 'get webdriver');
+
+                // 策略 1: 在原型链上定义
+                try {
+                    delete Navigator.prototype.webdriver;
+                    Object.defineProperty(Navigator.prototype, 'webdriver', {
+                        get: wdGetter, set: function() {}, configurable: true
+                    });
+                } catch(e) {}
+
+                // 策略 2: 在实例上覆盖（处理 Chrome 在实例上设置 own property 的情况）
+                try {
+                    delete navigator.webdriver;
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: wdGetter, set: function() {}, configurable: true
+                    });
+                } catch(e) {}
+
+                // 策略 3: 延迟重放（处理 Chrome 在 document_start 之后才设置 webdriver 的情况）
+                const reapplyWebdriver = () => {
+                    try {
+                        delete navigator.webdriver;
+                        Object.defineProperty(navigator, 'webdriver', {
+                            get: wdGetter, set: function() {}, configurable: true
+                        });
+                    } catch(e) {}
+                };
+                Promise.resolve().then(reapplyWebdriver);
+                setTimeout(reapplyWebdriver, 0);
+
+                // 移除 cdc_ 变量 (Puppeteer/ChromeDriver 特征)
                 const cdcRegex = /cdc_[a-zA-Z0-9]+/;
                 Object.keys(window).forEach((key) => {
                     if (cdcRegex.test(key)) {
                         try { delete window[key]; } catch (e) { }
                     }
                 });
-                ['$cdc_asdjflasutopfhvcZLmcfl_', '$chrome_asyncScriptInfo', 'callPhantom', 'webdriver'].forEach((k) => {
-                    if (window[k]) {
-                        try { delete window[k]; } catch (e) { }
-                    }
+                // 扩展自动化变量清理
+                ['$cdc_asdjflasutopfhvcZLmcfl_', '$chrome_asyncScriptInfo', 'callPhantom', 'webdriver',
+                 '__webdriver_evaluate', '__selenium_evaluate', '__fxdriver_evaluate', '__driver_evaluate',
+                 '__webdriver_unwrap', '__selenium_unwrap', '__fxdriver_unwrap', '__driver_unwrap',
+                 '_Selenium_IDE_Recorder', '_selenium', 'calledSelenium', '_WEBDRIVER_ELEM_CACHE',
+                 'ChromeDriverw', '__$webdriverAsyncExecutor'].forEach((k) => {
+                    try { if (window[k]) delete window[k]; } catch (e) { }
                 });
+                // 移除 document 上的自动化标记
+                try {
+                    if (document.documentElement) {
+                        document.documentElement.removeAttribute('webdriver');
+                        document.documentElement.removeAttribute('selenium');
+                        document.documentElement.removeAttribute('driver');
+                    }
+                } catch(e) {}
                 if (!window.chrome) {
                     Object.defineProperty(window, 'chrome', {
                         value: {
