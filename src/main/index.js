@@ -1768,6 +1768,163 @@ async function stopRunningProfile(profileId, options = {}) {
     return true;
 }
 
+// ============================================================================
+// Control Server（HTTP API，通过 --control-port 启用）
+// ============================================================================
+let controlServer = null;
+
+function getArgValue(name) {
+    const argv = process.argv || [];
+    const idx = argv.indexOf(name);
+    if (idx > -1) {
+        const value = argv[idx + 1];
+        if (value && typeof value === 'string' && !value.startsWith('--')) return value;
+    }
+    const prefix = name + '=';
+    const kv = argv.find(a => typeof a === 'string' && a.startsWith(prefix));
+    if (kv) return kv.slice(prefix.length);
+    return null;
+}
+
+function getControlConfig() {
+    const host = getArgValue('--control-host') || process.env.GEEKEZ_CONTROL_HOST || '127.0.0.1';
+    const portRaw = getArgValue('--control-port') || process.env.GEEKEZ_CONTROL_PORT || '';
+    const tokenRaw = getArgValue('--control-token') || process.env.GEEKEZ_CONTROL_TOKEN || '';
+    const port = portRaw ? Number(portRaw) : null;
+    const token = tokenRaw ? String(tokenRaw) : null;
+    return { host, port: Number.isFinite(port) ? port : null, token };
+}
+
+function sendControlJson(res, statusCode, payload) {
+    const body = JSON.stringify(payload);
+    res.statusCode = statusCode;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Content-Length', Buffer.byteLength(body));
+    res.end(body);
+}
+
+function readControlBody(req) {
+    return new Promise((resolve, reject) => {
+        let data = '';
+        req.on('data', chunk => { data += chunk.toString('utf8'); });
+        req.on('end', () => resolve(data));
+        req.on('error', reject);
+    });
+}
+
+async function readControlJsonBody(req) {
+    const text = await readControlBody(req);
+    if (!text) return {};
+    try { return JSON.parse(text); }
+    catch (e) { throw new Error('Invalid JSON'); }
+}
+
+async function startControlServer() {
+    if (controlServer) return;
+    const cfg = getControlConfig();
+    if (!cfg.port) return;
+
+    controlServer = http.createServer(async (req, res) => {
+        try {
+            const url = new URL(req.url || '/', `http://${cfg.host}:${cfg.port}`);
+            if (cfg.token) {
+                const auth = String(req.headers.authorization || '');
+                if (auth !== `Bearer ${cfg.token}`) {
+                    return sendControlJson(res, 401, { ok: false, error: 'Unauthorized' });
+                }
+            }
+
+            if (req.method === 'GET' && url.pathname === '/health') {
+                return sendControlJson(res, 200, { ok: true });
+            }
+
+            if (req.method === 'GET' && url.pathname === '/profiles') {
+                const profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
+                const items = (profiles || []).map(p => ({
+                    id: p.id,
+                    name: p.name,
+                    debugPort: p.debugPort || null,
+                    tags: p.tags || []
+                }));
+                return sendControlJson(res, 200, { ok: true, profiles: items });
+            }
+
+            const launchMatch = url.pathname.match(/^\/profiles\/([0-9a-fA-F-]{36})\/launch$/);
+            if (req.method === 'POST' && launchMatch) {
+                const profileId = launchMatch[1];
+                const body = await readControlJsonBody(req);
+
+                let profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
+                const idx = (profiles || []).findIndex(p => p.id === profileId);
+                if (idx === -1) return sendControlJson(res, 404, { ok: false, error: 'Profile not found' });
+
+                const profile = profiles[idx];
+                const requestedDebugPort = body && Object.prototype.hasOwnProperty.call(body, 'debugPort') ? body.debugPort : undefined;
+                const requestedEnableRemoteDebugging = body && Object.prototype.hasOwnProperty.call(body, 'enableRemoteDebugging') ? body.enableRemoteDebugging : undefined;
+
+                let mutatedProfiles = false;
+                if (requestedDebugPort === 0 || requestedDebugPort === 'auto') {
+                    profile.debugPort = await getAvailablePort();
+                    mutatedProfiles = true;
+                } else if (typeof requestedDebugPort === 'number' && Number.isFinite(requestedDebugPort)) {
+                    profile.debugPort = requestedDebugPort;
+                    mutatedProfiles = true;
+                }
+
+                if (mutatedProfiles) {
+                    profiles[idx] = profile;
+                    await fs.writeJson(PROFILES_FILE, profiles);
+                }
+
+                if (requestedEnableRemoteDebugging !== undefined || profile.debugPort) {
+                    const settings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : {};
+                    if (requestedEnableRemoteDebugging !== undefined) settings.enableRemoteDebugging = !!requestedEnableRemoteDebugging;
+                    else settings.enableRemoteDebugging = true;
+                    await fs.writeJson(SETTINGS_FILE, settings);
+                }
+
+                const message = await launchProfileHandler(null, profileId, body ? body.watermarkStyle : undefined);
+                const proc = activeProcesses[profileId];
+                const wsEndpoint = proc && proc.browser && typeof proc.browser.wsEndpoint === 'function' ? proc.browser.wsEndpoint() : null;
+                return sendControlJson(res, 200, {
+                    ok: true,
+                    profileId,
+                    message: message || null,
+                    debugPort: profile.debugPort || null,
+                    wsEndpoint
+                });
+            }
+
+            const stopMatch = url.pathname.match(/^\/profiles\/([0-9a-fA-F-]{36})\/stop$/);
+            if (req.method === 'POST' && stopMatch) {
+                const profileId = stopMatch[1];
+                const proc = activeProcesses[profileId];
+                if (!proc) {
+                    return sendControlJson(res, 200, { ok: true, profileId, message: 'Not running' });
+                }
+                try {
+                    await stopRunningProfile(profileId);
+                    return sendControlJson(res, 200, { ok: true, profileId, message: 'Stopped' });
+                } catch (err) {
+                    return sendControlJson(res, 500, { ok: false, error: err.message || 'Failed to stop' });
+                }
+            }
+
+            return sendControlJson(res, 404, { ok: false, error: 'Not found' });
+        } catch (err) {
+            return sendControlJson(res, 500, { ok: false, error: err && err.message ? err.message : 'Internal error' });
+        }
+    });
+
+    controlServer.on('error', (err) => {
+        console.error('[Control] Server error:', err && err.message ? err.message : err);
+    });
+
+    controlServer.listen(cfg.port, cfg.host, () => {
+        console.log(`[Control] Listening on http://${cfg.host}:${cfg.port}`);
+    });
+}
+
 async function stopAllRunningProfilesFromTray() {
     const runningIds = Object.keys(activeProcesses);
     if (runningIds.length === 0) return;
@@ -2530,6 +2687,13 @@ app.whenReady().then(async () => {
         }
     } catch (e) {
         console.error('Failed to auto-start Public API server:', e);
+    }
+
+    // Auto-start Control Server if --control-port is provided
+    try {
+        await startControlServer();
+    } catch (e) {
+        console.error('Failed to start Control Server:', e);
     }
 
     setTimeout(() => { fs.emptyDir(TRASH_PATH).catch(() => { }); }, 10000);
