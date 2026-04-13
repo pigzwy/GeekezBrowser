@@ -23,7 +23,7 @@
         </div>
 
         <label class="label-tiny">{{ $t('proxyLink') }}</label>
-        <textarea v-model="form.proxyStr" rows="4" placeholder="vmess://, ss://... (one per line for batch)" spellcheck="false" autocomplete="off"></textarea>
+        <textarea v-model="form.proxyStr" rows="4" placeholder="vmess://, ss://, socks5://... (one per line for batch)" spellcheck="false" autocomplete="off"></textarea>
         <div class="hint-text">{{ $t('batchHint') }}</div>
 
         <div class="flex-row">

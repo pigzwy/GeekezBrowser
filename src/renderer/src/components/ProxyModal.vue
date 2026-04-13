@@ -103,7 +103,7 @@
                 <span style="cursor:pointer" @click="uiStore.batchAddProxyModalVisible = false">✕</span>
             </div>
             <p style="font-size:12px; opacity:0.7; margin: 10px 0;">Paste links here (one per line). Supports vmess, vless, trojan, ss, socks5.</p>
-            <textarea v-model="batchInput" style="height:250px; font-family:monospace; font-size:11px; width: 100%; box-sizing: border-box;" placeholder="vmess://...&#10;ss://..."></textarea>
+            <textarea v-model="batchInput" style="height:250px; font-family:monospace; font-size:11px; width: 100%; box-sizing: border-box;" placeholder="vmess://...&#10;ss://...&#10;socks5://..."></textarea>
             <div style="text-align:right; margin-top:15px;">
                 <button class="primary" @click="handleSubmitBatch" :disabled="!batchInput.trim()">{{ $t('save') }}</button>
             </div>
