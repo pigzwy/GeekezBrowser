@@ -1883,7 +1883,8 @@ async function startControlServer() {
                     await fs.writeJson(SETTINGS_FILE, settings);
                 }
 
-                const message = await launchProfileHandler(null, profileId, body ? body.watermarkStyle : undefined);
+                const fakeEvent = { sender: { isDestroyed: () => true, send: () => {} } };
+                const message = await launchProfileHandler(fakeEvent, profileId, body ? body.watermarkStyle : undefined);
                 const proc = activeProcesses[profileId];
                 const wsEndpoint = proc && proc.browser && typeof proc.browser.wsEndpoint === 'function' ? proc.browser.wsEndpoint() : null;
                 return sendControlJson(res, 200, {
